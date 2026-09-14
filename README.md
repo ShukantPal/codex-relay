@@ -1,5 +1,7 @@
 # Codex relay
 
+_Managed by Pal's Muse._
+
 `relay` runs on a Mac and retains the latest 1,000 authenticated completion
 events. `poller` runs on the orchestrator VM, holds a long-poll request open,
 and writes delivered events as JSON Lines. This replaces a five-minute status
