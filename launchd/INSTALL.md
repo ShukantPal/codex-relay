@@ -15,6 +15,11 @@ Build the relay, then edit every `/REPLACE/...` path in
 IPv4 address at startup and binds only that address plus `127.0.0.1` on port
 8765. Do not change it to `0.0.0.0`, enable Funnel, or add public forwarding.
 
+Note: the daemon discovers the Tailscale IPv4 address by running
+`tailscale ip -4`, so the `tailscale` CLI must be on the daemon's PATH.
+If it lives outside the default PATH (e.g. a Nix install), add an
+`EnvironmentVariables` -> `PATH` entry to the installed plist.
+
 Copy and bootstrap the reviewed plist:
 
 ```sh
