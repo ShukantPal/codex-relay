@@ -6,8 +6,10 @@ and writes delivered events as JSON Lines. This replaces a five-minute status
 poll with normal delivery latency close to one network round trip.
 
 Delivery is at least once: downstream consumers must deduplicate using the
-event `id` (or relay epoch and sequence). The queue is durable but bounded;
-when it overflows, the poller reports a warning on stderr.
+event `id` (or relay epoch and sequence). POST idempotency applies while an
+event remains in the durable bounded queue; a replay after eviction is a new
+delivery. The queue is durable but bounded; when it overflows, the poller
+reports a warning on stderr.
 
 ## Build and test
 

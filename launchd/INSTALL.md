@@ -33,8 +33,8 @@ relay --secret-file ~/.codex/relay/relay.token \
 
 `--secret-file` can instead be supplied by `RELAY_SECRET_FILE`. The file must
 not be group/world readable and its content must be at least 32 bytes. For
-testing only, `--tailscale-ip` can set a specific additional address; ordinary
-operation discovers it using `tailscale ip -4`.
+testing only, `--tailscale-ip` can set a specific Tailscale IPv4 address;
+ordinary operation discovers it using `tailscale ip -4`.
 
 ## VM poller
 

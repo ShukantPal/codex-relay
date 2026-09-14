@@ -456,18 +456,26 @@ impl Store {
         if let Some(existing) = inner.events.iter().find(|event| event.id == id) {
             return Ok((existing.clone(), true));
         }
+        // Do not expose a new event until its complete state has been made
+        // durable. A failed write must leave retries eligible to be accepted.
+        let mut updated = Inner {
+            epoch: inner.epoch.clone(),
+            next_sequence: inner.next_sequence,
+            events: inner.events.clone(),
+        };
         let event = Event {
-            sequence: inner.next_sequence,
+            sequence: updated.next_sequence,
             id,
             received_at: timestamp(),
             payload,
         };
-        inner.next_sequence += 1;
-        inner.events.push_back(event.clone());
-        if inner.events.len() > self.limit {
-            inner.events.pop_front();
+        updated.next_sequence += 1;
+        updated.events.push_back(event.clone());
+        if updated.events.len() > self.limit {
+            updated.events.pop_front();
         }
-        self.save(&inner)?;
+        self.save(&updated)?;
+        *inner = updated;
         self.changed.notify_all();
         Ok((event, false))
     }
@@ -485,7 +493,7 @@ impl Store {
         let reset = !requested_epoch.is_empty() && requested_epoch != inner.epoch;
         let after = if reset { 0 } else { after };
         let deadline = Instant::now() + timeout;
-        while !available(&inner, after) {
+        while !reset && !available(&inner, after) {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
@@ -766,6 +774,69 @@ mod tests {
         let (elapsed, result) = waiting.join().unwrap();
         assert!(elapsed < Duration::from_millis(500));
         assert_eq!(result.events[0].id, "wake");
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn failed_persist_does_not_accept_or_expose_event() {
+        let parent = path("read-only-directory");
+        fs::create_dir(&parent).unwrap();
+        let store = Store::open(parent.join("events.json"), 10).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        assert!(store.add(event("not-durable")).is_err());
+        let result = store.read(0, "", Duration::ZERO).unwrap();
+        assert!(result.events.is_empty());
+        assert_eq!(result.next, 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn epoch_mismatch_returns_immediately_when_empty() {
+        let file = path("epoch-reset");
+        let store = Store::open(&file, 10).unwrap();
+        let start = Instant::now();
+        let result = store
+            .read(42, "previous-epoch", Duration::from_secs(2))
+            .unwrap();
+        assert!(result.reset);
+        assert!(result.events.is_empty());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn idempotency_survives_restart_while_event_is_retained() {
+        let file = path("restart-idempotency");
+        let store = Store::open(&file, 2).unwrap();
+        let (first, duplicate) = store.add(event("job-1")).unwrap();
+        assert!(!duplicate);
+        drop(store);
+        let (second, duplicate) = Store::open(&file, 2).unwrap().add(event("job-1")).unwrap();
+        assert!(duplicate);
+        assert_eq!(first, second);
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secret_file_requires_private_permissions_and_a_long_token() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = path("secret");
+        fs::write(&file, format!("{}\n", "x".repeat(32))).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_secret_file(&file).unwrap(), "x".repeat(32));
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_secret_file(&file).is_err());
         let _ = fs::remove_file(file);
     }
 }

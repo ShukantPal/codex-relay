@@ -348,3 +348,66 @@ fn encode(input: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "codex-relay-poller-{name}-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn cursor_round_trip_is_private_and_restart_safe() {
+        let file = path("cursor");
+        let expected = Cursor {
+            epoch: "epoch-1".to_owned(),
+            after: 42,
+        };
+        save_cursor(&file, &expected).unwrap();
+        let actual = load_cursor(&file).unwrap();
+        assert_eq!(actual.epoch, expected.epoch);
+        assert_eq!(actual.after, expected.after);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o077, 0);
+        }
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn missing_cursor_starts_at_the_beginning() {
+        let file = path("missing-cursor");
+        let cursor = load_cursor(&file).unwrap();
+        assert!(cursor.epoch.is_empty());
+        assert_eq!(cursor.after, 0);
+    }
+
+    #[test]
+    fn relay_url_and_timeout_validation_reject_unsafe_inputs() {
+        assert!(parse_url("https://relay.example").is_err());
+        assert!(parse_url("http://user@relay.example").is_err());
+        assert!(
+            config(vec![
+                "--relay-url".to_owned(),
+                "http://100.101.237.83:8765".to_owned(),
+                "--secret-file".to_owned(),
+                "/token".to_owned(),
+                "--state-file".to_owned(),
+                "/cursor".to_owned(),
+                "--timeout".to_owned(),
+                "56".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+}

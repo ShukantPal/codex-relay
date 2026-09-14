@@ -77,7 +77,15 @@ fn config(arguments: Vec<String>) -> Result<Config, String> {
             "--secret-file" => secret_file = Some(PathBuf::from(value(&mut values, "--secret-file")?)),
             "--state-file" => state_file = Some(PathBuf::from(value(&mut values, "--state-file")?)),
             "--port" => port = value(&mut values, "--port")?.parse().map_err(|_| "--port must be a valid u16".to_owned())?,
-            "--tailscale-ip" => tailscale_ip = Some(value(&mut values, "--tailscale-ip")?.parse().map_err(|_| "--tailscale-ip must be an IP address".to_owned())?),
+            "--tailscale-ip" => {
+                let address = value(&mut values, "--tailscale-ip")?
+                    .parse()
+                    .map_err(|_| "--tailscale-ip must be an IP address".to_owned())?;
+                if !is_tailscale_ipv4(address) {
+                    return Err("--tailscale-ip must be a Tailscale IPv4 address".to_owned());
+                }
+                tailscale_ip = Some(address);
+            }
             "--max-events" => max_events = value(&mut values, "--max-events")?.parse().map_err(|_| "--max-events must be a positive integer".to_owned())?,
             "--help" | "-h" => return Err("usage: relay --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
@@ -112,6 +120,10 @@ fn resolve_tailscale_ip() -> Result<IpAddr, String> {
         .ok_or_else(|| "tailscale ip -4 returned no address".to_owned())?
         .parse()
         .map_err(|_| "tailscale ip -4 returned an invalid address".to_owned())
+}
+
+fn is_tailscale_ipv4(address: IpAddr) -> bool {
+    matches!(address, IpAddr::V4(address) if address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1]))
 }
 
 fn serve(listener: TcpListener, state: Arc<Server>) {
@@ -187,6 +199,19 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
             return Ok(());
         }
     };
+    if payload
+        .object("id")
+        .and_then(Json::as_str)
+        .filter(|id| !id.is_empty())
+        .is_none()
+    {
+        reply(
+            stream,
+            400,
+            error("body_must_be_an_object_with_nonempty_id"),
+        )?;
+        return Ok(());
+    }
     match state.store.add(payload) {
         Ok((event, duplicate)) => reply(
             stream,
@@ -196,15 +221,32 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
                 ("event".to_owned(), event.response_json()),
             ]),
         ),
-        Err(_) => reply(
-            stream,
-            400,
-            error("body_must_be_an_object_with_nonempty_id"),
-        ),
+        Err(_) => reply(stream, 500, error("could_not_persist_event")),
     }
 }
 
 fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), String> {
+    let (after, timeout, epoch) = match get_query(target) {
+        Ok(query) => query,
+        Err(message) => {
+            reply(stream, 400, error(&message))?;
+            return Ok(());
+        }
+    };
+    let result = state
+        .store
+        .read(after, &epoch, Duration::from_secs(timeout));
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => {
+            reply(stream, 500, error("could_not_read_events"))?;
+            return Ok(());
+        }
+    };
+    reply(stream, 200, read_json(result))
+}
+
+fn get_query(target: &str) -> Result<(u64, u64, String), String> {
     let query = query(target)?;
     let after = query.get("after").map_or(Ok(0), |value| {
         value
@@ -217,15 +259,13 @@ fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), Strin
             .map_err(|_| "timeout must be an integer".to_owned())
     })?;
     if timeout > 55 {
-        reply(stream, 400, error("timeout must be between 0 and 55"))?;
-        return Ok(());
+        return Err("timeout must be between 0 and 55".to_owned());
     }
-    let result = state.store.read(
+    Ok((
         after,
-        query.get("epoch").map(String::as_str).unwrap_or(""),
-        Duration::from_secs(timeout),
-    )?;
-    reply(stream, 200, read_json(result))
+        timeout,
+        query.get("epoch").cloned().unwrap_or_default(),
+    ))
 }
 
 fn read_json(result: ReadResult) -> Json {
@@ -362,4 +402,41 @@ fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
         _ => "Internal Server Error",
     };
     stream.write_all(format!("HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_get_query_is_a_bad_request() {
+        assert_eq!(
+            get_query("/v1/events?after=not-a-number").unwrap_err(),
+            "after must be a non-negative integer"
+        );
+        assert_eq!(
+            get_query("/v1/events?epoch=%ZZ").unwrap_err(),
+            "invalid URL encoding"
+        );
+    }
+
+    #[test]
+    fn bearer_comparison_requires_the_full_token() {
+        assert!(authorized(
+            &format!("Bearer {}", "x".repeat(32)),
+            &"x".repeat(32)
+        ));
+        assert!(!authorized("Bearer x", &"x".repeat(32)));
+        assert!(!authorized(
+            &format!("Bearer {}suffix", "x".repeat(32)),
+            &"x".repeat(32)
+        ));
+    }
+
+    #[test]
+    fn explicit_bind_address_must_be_tailscale_ipv4() {
+        assert!(is_tailscale_ipv4("100.101.237.83".parse().unwrap()));
+        assert!(!is_tailscale_ipv4("0.0.0.0".parse().unwrap()));
+        assert!(!is_tailscale_ipv4("127.0.0.1".parse().unwrap()));
+    }
 }
