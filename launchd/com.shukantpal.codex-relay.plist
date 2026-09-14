@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shukantpal.codex-relay</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/REPLACE/WITH/ABSOLUTE/PATH/relay</string>
+    <string>--secret-file</string>
+    <string>/Users/REPLACE/.codex/relay/relay.token</string>
+    <string>--state-file</string>
+    <string>/Users/REPLACE/.codex/relay/events.json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE/.codex/relay/relay.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE/.codex/relay/relay.error.log</string>
+</dict>
+</plist>
