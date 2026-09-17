@@ -23,6 +23,8 @@ struct Config {
     port: u16,
     tailscale_ip: Option<IpAddr>,
     max_events: usize,
+    github_watch_repos: Vec<String>,
+    github_watch_interval: Duration,
 }
 struct Server {
     secret: String,
@@ -58,6 +60,12 @@ fn run() -> Result<(), String> {
         secret,
         store: Store::open(config.state_file, config.max_events)?,
     });
+    if !config.github_watch_repos.is_empty() {
+        let state = Arc::clone(&state);
+        let repos = config.github_watch_repos.clone();
+        let interval = config.github_watch_interval;
+        thread::spawn(move || github_watch_loop(state, repos, interval));
+    }
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
         SocketAddr::new(IpAddr::from([127, 0, 0, 1]), config.port),
@@ -81,6 +89,8 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut port = 8765;
     let mut tailscale_ip = None;
     let mut max_events = 1000;
+    let mut github_watch_repos = Vec::new();
+    let mut github_watch_interval = Duration::from_secs(30);
     let mut values = arguments.into_iter();
     while let Some(argument) = values.next() {
         let value = |values: &mut std::vec::IntoIter<String>, name: &str| {
@@ -102,7 +112,25 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
                 tailscale_ip = Some(address);
             }
             "--max-events" => max_events = value(&mut values, "--max-events")?.parse().map_err(|_| "--max-events must be a positive integer".to_owned())?,
-            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000]".to_owned()),
+            "--watch-repo" => {
+                let repo = value(&mut values, "--watch-repo")?;
+                if !valid_github_repo(&repo) {
+                    return Err("--watch-repo must be an OWNER/REPO GitHub name".to_owned());
+                }
+                if !github_watch_repos.contains(&repo) {
+                    github_watch_repos.push(repo);
+                }
+            }
+            "--watch-interval" => {
+                let seconds = value(&mut values, "--watch-interval")?
+                    .parse::<u64>()
+                    .map_err(|_| "--watch-interval must be an integer".to_owned())?;
+                if !(30..=3600).contains(&seconds) {
+                    return Err("--watch-interval must be between 30 and 3600 seconds".to_owned());
+                }
+                github_watch_interval = Duration::from_secs(seconds);
+            }
+            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -119,7 +147,111 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         port,
         tailscale_ip,
         max_events,
+        github_watch_repos,
+        github_watch_interval,
     })
+}
+
+fn valid_github_repo(repo: &str) -> bool {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return false;
+    };
+    !owner.is_empty()
+        && !name.is_empty()
+        && !name.contains('/')
+        && owner
+            .bytes()
+            .chain(name.bytes())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration) {
+    loop {
+        for repo in &repos {
+            match github_open_pull_requests(repo) {
+                Ok(pull_requests) => {
+                    for (number, url) in pull_requests {
+                        let id = format!("github-pr-opened:{repo}:{number}");
+                        let payload = Json::Object(vec![
+                            ("id".to_owned(), Json::String(id.clone())),
+                            (
+                                "kind".to_owned(),
+                                Json::String("github_pr_opened".to_owned()),
+                            ),
+                            ("repository".to_owned(), Json::String(repo.clone())),
+                            ("pull_request".to_owned(), Json::number(number)),
+                            ("url".to_owned(), Json::String(url)),
+                        ]);
+                        match state.store.add(payload) {
+                            Ok((_, false)) => {
+                                eprintln!("queued GitHub PR watchdog event for {repo}#{number}")
+                            }
+                            Ok((_, true)) => {}
+                            Err(_) => eprintln!(
+                                "could not persist GitHub PR watchdog event for {repo}#{number}"
+                            ),
+                        }
+                    }
+                }
+                Err(error) => eprintln!("GitHub PR watch for {repo} failed: {error}"),
+            }
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>, String> {
+    let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
+    let request = exec::ExecRequest {
+        id: format!("github-pr-scan-{repo}"),
+        bin: "gh".to_owned(),
+        args: vec![
+            "api".to_owned(),
+            "--paginate".to_owned(),
+            "--slurp".to_owned(),
+            format!("repos/{repo}/pulls?state=open&per_page=100"),
+        ],
+    };
+    let path = policy
+        .allowed_path(&request.bin, &request.args)
+        .ok_or_else(|| "the gh policy does not allow the PR scan".to_owned())?;
+    let result = exec::run(path, request);
+    if result.timed_out || result.truncated || result.exit_code != Some(0) {
+        return Err("GitHub PR discovery did not complete successfully".to_owned());
+    }
+    parse_github_open_pull_requests(&result.stdout)
+}
+
+fn parse_github_open_pull_requests(output: &str) -> Result<Vec<(u64, String)>, String> {
+    let value = parse_json(output)
+        .map_err(|_| "GitHub PR discovery did not return the expected JSON".to_owned())?;
+    let Json::Array(pull_requests) = value else {
+        return Err("GitHub PR discovery did not return a JSON array".to_owned());
+    };
+    let pull_requests: Vec<_> = pull_requests
+        .iter()
+        .flat_map(|page| match page {
+            Json::Array(pull_requests) => pull_requests.iter().collect(),
+            pull_request => vec![pull_request],
+        })
+        .collect();
+    pull_requests
+        .iter()
+        .map(|pull_request| {
+            let number = pull_request
+                .object("number")
+                .and_then(Json::as_u64)
+                .filter(|number| *number > 0)
+                .ok_or_else(|| "GitHub PR discovery result is missing a PR number".to_owned())?;
+            let url = pull_request
+                .object("html_url")
+                .or_else(|| pull_request.object("url"))
+                .and_then(Json::as_str)
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| "GitHub PR discovery result is missing a PR URL".to_owned())?;
+            Ok((number, url.to_owned()))
+        })
+        .collect()
 }
 
 fn run_config(arguments: &[String]) -> Result<(), String> {
@@ -703,5 +835,64 @@ mod tests {
             read_request(&mut server),
             Err(ReadRequestError::ExecDenied)
         ));
+    }
+
+    #[test]
+    fn github_watch_repo_validation_rejects_unscoped_or_malformed_names() {
+        assert!(valid_github_repo("leveled-inc/leveled"));
+        assert!(valid_github_repo("owner.name/repo_name-2"));
+        assert!(!valid_github_repo("leveled"));
+        assert!(!valid_github_repo("owner/repo/extra"));
+        assert!(!valid_github_repo("owner/repo space"));
+    }
+
+    #[test]
+    fn github_watch_configuration_is_opt_in_and_rate_limited() {
+        let base_arguments = || {
+            vec![
+                "--secret-file".to_owned(),
+                "/token".to_owned(),
+                "--state-file".to_owned(),
+                "/state".to_owned(),
+            ]
+        };
+        let config = server_config(base_arguments()).unwrap();
+        assert!(config.github_watch_repos.is_empty());
+        assert_eq!(config.github_watch_interval, Duration::from_secs(30));
+
+        let mut arguments = base_arguments();
+        arguments.extend([
+            "--watch-repo".to_owned(),
+            "leveled-inc/leveled".to_owned(),
+            "--watch-interval".to_owned(),
+            "60".to_owned(),
+        ]);
+        let config = server_config(arguments).unwrap();
+        assert_eq!(config.github_watch_repos, ["leveled-inc/leveled"]);
+        assert_eq!(config.github_watch_interval, Duration::from_secs(60));
+
+        let mut arguments = base_arguments();
+        arguments.extend(["--watch-interval".to_owned(), "29".to_owned()]);
+        assert!(server_config(arguments).is_err());
+    }
+
+    #[test]
+    fn github_pr_scan_requires_numbers_and_urls() {
+        assert_eq!(
+            parse_github_open_pull_requests(
+                r#"[[{"number":42,"html_url":"https://github.com/leveled-inc/leveled/pull/42"}]]"#,
+            )
+            .unwrap(),
+            vec![(
+                42,
+                "https://github.com/leveled-inc/leveled/pull/42".to_owned()
+            )]
+        );
+        assert!(parse_github_open_pull_requests(r#"{"number":42}"#).is_err());
+        assert!(parse_github_open_pull_requests(r#"[{"number":42,"url":""}]"#).is_err());
+        assert!(
+            parse_github_open_pull_requests(r#"[{"number":0,"url":"https://example.test"}]"#)
+                .is_err()
+        );
     }
 }

@@ -6,7 +6,7 @@
 
 use keyring::Entry;
 use relay_core::{Json, parse_json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -32,6 +32,7 @@ pub struct Policy {
 struct BinPolicy {
     path: String,
     commands: Vec<Vec<String>>,
+    gh_read_repos: BTreeSet<String>,
 }
 
 pub struct ExecRequest {
@@ -86,7 +87,11 @@ impl Policy {
                 return Err(format!("duplicate binary name: {name}"));
             }
             let fields = object_fields(value, "binary policy")?;
-            require_only(fields, &["path", "commands"], "binary policy")?;
+            require_allowed(
+                fields,
+                &["path", "commands", "gh_read_repos"],
+                "binary policy",
+            )?;
             let path = field(fields, "path")
                 .and_then(Json::as_str)
                 .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
@@ -115,11 +120,37 @@ impl Policy {
                     .collect();
                 parsed_commands.push(prefix);
             }
+            let gh_read_repos = match field(fields, "gh_read_repos") {
+                None => BTreeSet::new(),
+                Some(Json::Array(repos)) if !repos.is_empty() => repos
+                    .iter()
+                    .map(Json::as_str)
+                    .collect::<Option<Vec<_>>>()
+                    .filter(|repos| repos.iter().all(|repo| valid_github_repo(repo)))
+                    .ok_or_else(|| {
+                        format!("binary {name} gh_read_repos must contain GitHub OWNER/REPO names")
+                    })?
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                _ => {
+                    return Err(format!(
+                        "binary {name} gh_read_repos must be a non-empty array"
+                    ));
+                }
+            };
+            if name == "gh" && gh_read_repos.is_empty() {
+                return Err("binary gh requires a non-empty gh_read_repos array".to_owned());
+            }
+            if name != "gh" && !gh_read_repos.is_empty() {
+                return Err(format!("binary {name} may not set gh_read_repos"));
+            }
             parsed.insert(
                 name.clone(),
                 BinPolicy {
                     path: path.to_owned(),
                     commands: parsed_commands,
+                    gh_read_repos,
                 },
             );
         }
@@ -132,26 +163,35 @@ impl Policy {
             .bins
             .iter()
             .map(|(name, policy)| {
-                (
-                    name.clone(),
-                    Json::Object(vec![
-                        ("path".to_owned(), Json::String(policy.path.clone())),
-                        (
-                            "commands".to_owned(),
-                            Json::Array(
-                                policy
-                                    .commands
-                                    .iter()
-                                    .map(|prefix| {
-                                        Json::Array(
-                                            prefix.iter().cloned().map(Json::String).collect(),
-                                        )
-                                    })
-                                    .collect(),
-                            ),
+                let mut fields = vec![
+                    ("path".to_owned(), Json::String(policy.path.clone())),
+                    (
+                        "commands".to_owned(),
+                        Json::Array(
+                            policy
+                                .commands
+                                .iter()
+                                .map(|prefix| {
+                                    Json::Array(prefix.iter().cloned().map(Json::String).collect())
+                                })
+                                .collect(),
                         ),
-                    ]),
-                )
+                    ),
+                ];
+                if !policy.gh_read_repos.is_empty() {
+                    fields.push((
+                        "gh_read_repos".to_owned(),
+                        Json::Array(
+                            policy
+                                .gh_read_repos
+                                .iter()
+                                .cloned()
+                                .map(Json::String)
+                                .collect(),
+                        ),
+                    ));
+                }
+                (name.clone(), Json::Object(fields))
             })
             .collect();
         Json::Object(vec![("bins".to_owned(), Json::Object(bins))]).to_json()
@@ -159,12 +199,119 @@ impl Policy {
 
     pub fn allowed_path(&self, bin: &str, args: &[String]) -> Option<&str> {
         let policy = self.bins.get(bin)?;
-        policy
-            .commands
-            .iter()
-            .any(|prefix| args.starts_with(prefix))
-            .then_some(policy.path.as_str())
+        (policy.commands.iter().any(|prefix| args.starts_with(prefix))
+            // `gh api` defaults to GET, but its flexible flags can otherwise
+            // turn a superficially read-only allowlist prefix into a write.
+            // Keep the policy useful for per-PR reads while making the
+            // read-only property enforceable by this process.
+            && (bin != "gh" || is_read_only_gh_command(args, &policy.gh_read_repos)))
+        .then_some(policy.path.as_str())
     }
+}
+
+fn is_read_only_gh_command(args: &[String], repos: &BTreeSet<String>) -> bool {
+    match args {
+        [command, subcommand, rest @ ..]
+            if command == "pr" && matches!(subcommand.as_str(), "list" | "view" | "checks") =>
+        {
+            gh_repo_argument(rest).is_some_and(|repo| repos.contains(repo))
+                && !rest
+                    .iter()
+                    .any(|argument| argument == "--web" || argument.starts_with("--web="))
+        }
+        [command, rest @ ..] if command == "api" => is_read_only_gh_api(rest, repos),
+        _ => false,
+    }
+}
+
+/// `gh api` has write-capable flags which may appear before or after the
+/// endpoint. Only permit the three REST resources a PR watchdog needs, and a
+/// small set of output-only flags. With no method/body flags, `gh api` uses
+/// its GET default.
+fn is_read_only_gh_api(args: &[String], repos: &BTreeSet<String>) -> bool {
+    let mut endpoint = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        match argument.as_str() {
+            "--paginate" | "--slurp" | "--silent" | "--include" => index += 1,
+            "--jq" | "--template" | "--cache" => {
+                if index + 1 == args.len() {
+                    return false;
+                }
+                index += 2;
+            }
+            _ if argument.starts_with('-') => return false,
+            _ if endpoint.replace(argument.as_str()).is_some() => return false,
+            _ => index += 1,
+        }
+    }
+    endpoint
+        .and_then(pr_watchdog_read_endpoint_repo)
+        .is_some_and(|repo| repos.contains(&repo))
+}
+
+fn gh_repo_argument(args: &[String]) -> Option<&str> {
+    let mut repo = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let candidate = if argument == "--repo" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            argument.strip_prefix("--repo=")
+        };
+        if let Some(candidate) = candidate
+            && (repo.replace(candidate).is_some() || !valid_github_repo(candidate))
+        {
+            return None;
+        }
+        index += 1;
+    }
+    repo
+}
+
+fn pr_watchdog_read_endpoint_repo(endpoint: &str) -> Option<String> {
+    let segments: Vec<_> = endpoint
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .collect();
+    match segments.as_slice() {
+        ["repos", owner, repo, "issues", number, "comments"]
+        | ["repos", owner, repo, "pulls", number, "comments"]
+        | ["repos", owner, repo, "pulls", number, "reviews"]
+            if valid_github_name(owner)
+                && valid_github_name(repo)
+                && number.parse::<u64>().is_ok_and(|number| number > 0) =>
+        {
+            Some(format!("{owner}/{repo}"))
+        }
+        ["repos", owner, repo, "pulls"]
+            if valid_github_name(owner)
+                && valid_github_name(repo)
+                && endpoint.ends_with("?state=open&per_page=100") =>
+        {
+            Some(format!("{owner}/{repo}"))
+        }
+        _ => None,
+    }
+}
+
+fn valid_github_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_github_repo(value: &str) -> bool {
+    let Some((owner, repo)) = value.split_once('/') else {
+        return false;
+    };
+    valid_github_name(owner) && valid_github_name(repo) && !repo.contains('/')
 }
 
 fn object_fields<'a>(json: &'a Json, name: &str) -> Result<&'a [(String, Json)], String> {
@@ -201,6 +348,21 @@ fn require_only(fields: &[(String, Json)], allowed: &[&str], name: &str) -> Resu
         .any(|(index, (name, _))| fields[..index].iter().any(|(previous, _)| previous == name))
     {
         return Err(format!("{name} contains a duplicate field"));
+    }
+    Ok(())
+}
+
+fn require_allowed(fields: &[(String, Json)], allowed: &[&str], name: &str) -> Result<(), String> {
+    if fields
+        .iter()
+        .any(|(field_name, _)| !allowed.contains(&field_name.as_str()))
+        || fields.iter().enumerate().any(|(index, (field_name, _))| {
+            fields[..index]
+                .iter()
+                .any(|(previous, _)| previous == field_name)
+        })
+    {
+        return Err(format!("{name} contains an unknown or duplicate field"));
     }
     Ok(())
 }
@@ -425,6 +587,136 @@ mod tests {
         assert_eq!(policy.allowed_path("jules", &args(&["login"])), None);
         assert_eq!(policy.allowed_path("jules", &args(&["logout"])), None);
         assert_eq!(policy.allowed_path("unknown", &args(&["new"])), None);
+    }
+
+    #[test]
+    fn gh_policy_permits_only_pr_reads_and_safe_api_reads() {
+        let policy = policy(
+            r#"{"bins":{"gh":{"path":"/opt/homebrew/bin/gh","commands":[["pr","list"],["pr","view"],["pr","checks"],["api"]],"gh_read_repos":["leveled-inc/leveled"]}}}"#,
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&["pr", "checks", "42", "--repo", "leveled-inc/leveled"]),
+                )
+                .is_some()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&[
+                        "api",
+                        "--paginate",
+                        "--slurp",
+                        "repos/leveled-inc/leveled/pulls?state=open&per_page=100",
+                    ]),
+                )
+                .is_some()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&[
+                        "api",
+                        "repos/leveled-inc/leveled/issues/42/comments",
+                        "--paginate",
+                    ]),
+                )
+                .is_some()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&[
+                        "api",
+                        "--jq",
+                        ".[]",
+                        "repos/leveled-inc/leveled/pulls/42/reviews"
+                    ]),
+                )
+                .is_some()
+        );
+        assert!(
+            policy
+                .allowed_path("gh", &args(&["pr", "view", "42", "--web"]))
+                .is_none()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&[
+                        "api",
+                        "repos/leveled-inc/leveled/issues/42/comments",
+                        "--method=POST",
+                    ]),
+                )
+                .is_none()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&[
+                        "api",
+                        "repos/leveled-inc/leveled/issues/42/comments",
+                        "--raw-field=x",
+                    ]),
+                )
+                .is_none()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&[
+                        "pr",
+                        "view",
+                        "42",
+                        "--repo=leveled-inc/leveled",
+                        "--web=true"
+                    ]),
+                )
+                .is_none()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&["pr", "view", "42", "--repo", "other-org/private"]),
+                )
+                .is_none()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&[
+                        "api",
+                        "repos/leveled-inc/leveled/issues/42/comments",
+                        "--method",
+                        "POST",
+                    ]),
+                )
+                .is_none()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&["api", "repos/leveled-inc/leveled/issues/42/reactions"])
+                )
+                .is_none()
+        );
+        assert!(
+            policy
+                .allowed_path("gh", &args(&["issue", "close", "42"]))
+                .is_none()
+        );
     }
 
     #[test]
