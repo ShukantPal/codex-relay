@@ -3,22 +3,22 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.shukantpal.codex-relay</string>
+  <string>com.shukantpal.zigzag</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/REPLACE/WITH/ABSOLUTE/PATH/relay</string>
+    <string>/REPLACE/WITH/ABSOLUTE/PATH/zigzag</string>
     <string>--secret-file</string>
-    <string>/Users/REPLACE/.codex/relay/relay.token</string>
+    <string>/Users/REPLACE/.codex/zigzag/zigzag.token</string>
     <string>--state-file</string>
-    <string>/Users/REPLACE/.codex/relay/events.json</string>
+    <string>/Users/REPLACE/.codex/zigzag/events.json</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/REPLACE/.codex/relay/relay.log</string>
+  <string>/Users/REPLACE/.codex/zigzag/zigzag.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/REPLACE/.codex/relay/relay.error.log</string>
+  <string>/Users/REPLACE/.codex/zigzag/zigzag.error.log</string>
 </dict>
 </plist>

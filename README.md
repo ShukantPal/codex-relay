@@ -1,14 +1,14 @@
-# Codex relay
+# Zigzag
 
 _Managed by Pal's Muse._
 
-`relay` runs on a Mac and retains the latest 1,000 authenticated completion
+`zigzag` runs on a Mac and retains the latest 1,000 authenticated completion
 events. `poller` runs on the orchestrator VM, holds a long-poll request open,
 and writes delivered events as JSON Lines. This replaces a five-minute status
 poll with normal delivery latency close to one network round trip.
 
 Delivery is at least once: downstream consumers must deduplicate using the
-event `id` (or relay epoch and sequence). POST idempotency applies while an
+event `id` (or Zigzag epoch and sequence). POST idempotency applies while an
 event remains in the durable bounded queue; a replay after eviction is a new
 delivery. The queue is durable but bounded; when it overflows, the poller
 reports a warning on stderr.

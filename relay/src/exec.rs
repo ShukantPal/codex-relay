@@ -1,8 +1,8 @@
 //! Policy-driven command execution in the Mac's GUI login session.
 //!
 //! The policy is intentionally stored in the login keychain rather than in a
-//! relay flag or environment variable. An SSH session cannot read or modify
-//! that item, while the owner can update it with `relay config set-allowlist`.
+//! Zigzag flag or environment variable. An SSH session cannot read or modify
+//! that item, while the owner can update it with `zigzag config set-allowlist`.
 
 use keyring::Entry;
 use relay_core::{Json, parse_json};
@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const KEYCHAIN_SERVICE: &str = "codex-relay";
+const KEYCHAIN_SERVICE: &str = "zigzag";
 const KEYCHAIN_ACCOUNT: &str = "exec-allowlist";
 /// Upper bound for one synchronous execution; the HTTP client must allow a
 /// slightly larger read timeout.
