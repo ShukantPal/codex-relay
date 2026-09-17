@@ -41,6 +41,98 @@ not be group/world readable and its content must be at least 32 bytes. For
 testing only, `--tailscale-ip` can set a specific Tailscale IPv4 address;
 ordinary operation discovers it using `tailscale ip -4`.
 
+## GitHub PR watchdog events
+
+The relay can discover open pull requests in explicitly watched repositories
+and enqueue one durable `github_pr_opened` event per PR. This is the trigger
+for the VM department worker; it does not run Codex or mutate GitHub from the
+Mac. Add one `--watch-repo` argument for each repository to the reviewed
+LaunchAgent arguments (beginning with `leveled-inc/leveled`):
+
+```sh
+zigzag --secret-file ~/.codex/zigzag/zigzag.token \
+  --state-file ~/.codex/zigzag/events.json \
+  --watch-repo leveled-inc/leveled \
+  --watch-interval 30
+```
+
+The supplied LaunchAgent template includes this initial repository; add
+additional `--watch-repo` argument pairs only after reviewing their scope.
+
+The template starts the scan, but it fails closed (and logs a policy error)
+until the owner installs the `gh` policy fragment below. Each scan then runs
+exactly this read-only command through the policy boundary:
+
+```sh
+gh api --paginate --slurp repos/leveled-inc/leveled/pulls?state=open\&per_page=100
+```
+
+Newly discovered PRs produce a stable event id such as
+`github-pr-opened:leveled-inc/leveled:42` and this payload:
+
+```json
+{"id":"github-pr-opened:leveled-inc/leveled:42","kind":"github_pr_opened","repository":"leveled-inc/leveled","pull_request":42,"url":"https://github.com/leveled-inc/leveled/pull/42"}
+```
+
+On a relay restart, and after bounded event-queue eviction, already-open PRs
+may be rediscovered. `dept.py` must use the repository/PR pair as a durable
+watchdog lease key (with the event id as its idempotency key), so recovery can
+re-offer delivery without creating a second active watchdog.
+
+### Department handoff
+
+Run the existing VM poller continuously and send its JSON Lines to the
+department event adapter. For a `github_pr_opened` event, that adapter creates
+or resumes a Codex worker using the repository/PR lease key and event id from
+the payload. The worker must remain active until CI is green and then keep
+polling for later feedback. Its required loop is:
+
+1. Read PR state and checks through Zigzag's read-only `gh` endpoint.
+2. On every poll, read both issue comments and pull-request review comments.
+3. For each unacknowledged comment by `ShukantPal`, add an eyes reaction in
+   that same poll cycle, address the requested change on the PR branch, push
+   the branch, and return to the CI watch.
+4. Persist the GitHub comment id in the department task state before the next
+   poll, so a restart cannot acknowledge or apply the same feedback twice.
+
+The reaction and branch push are intentionally performed by the VM-side Codex
+worker using its GitHub credentials, not by the Mac relay. The relay policy
+below is read-only and cannot create reactions, merge PRs, or push code.
+
+### Owner approval required: proposed `gh` policy addition
+
+Do **not** apply this from a remote session. This is an additive diff for the
+owner's Keychain-held allowlist, to be reviewed and installed from the local
+macOS GUI session with `zigzag config set-allowlist --file PATH`.
+
+```diff
+ {
+   "bins": {
++    "gh": {
++      "path": "/opt/homebrew/bin/gh",
++      "commands": [
++        ["pr", "list"],
++        ["pr", "view"],
++        ["pr", "checks"],
++        ["api"]
++      ],
++      "gh_read_repos": ["leveled-inc/leveled"]
++    },
+     "existing-binary": { "path": "/existing/path", "commands": [["existing-command"]] }
+   }
+ }
+```
+
+`/opt/homebrew/bin/gh` must be replaced with the owner's actual absolute `gh`
+path. Zigzag additionally restricts the `gh` entry to the repositories named
+in `gh_read_repos`, `pr list`, `pr view`, `pr checks`, and GET-only `api` calls
+for PR discovery, issue comments, review comments, and reviews. It rejects
+`--method`, `-X`, body flags, all other `gh` subcommands, and `--web` (including
+`--web=true`), so this policy cannot be used to write GitHub state or read a
+different repository.
+The policy is deliberately not stored in this repository and this change does
+not touch the live Keychain item.
+
 ## Exec endpoint
 
 Zigzag runs as a LaunchAgent inside the Mac's GUI login session, where the
