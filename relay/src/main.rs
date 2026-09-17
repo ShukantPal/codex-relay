@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+mod jules;
+
 const MAX_BODY: usize = 64 * 1024;
 
 struct Config {
@@ -17,10 +19,12 @@ struct Config {
     port: u16,
     tailscale_ip: Option<IpAddr>,
     max_events: usize,
+    jules_bin: String,
 }
 struct Server {
     secret: String,
     store: Store,
+    jules_bin: String,
 }
 struct Request {
     method: String,
@@ -42,6 +46,7 @@ fn run() -> Result<(), String> {
     let state = Arc::new(Server {
         secret,
         store: Store::open(config.state_file, config.max_events)?,
+        jules_bin: config.jules_bin,
     });
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
@@ -66,6 +71,8 @@ fn config(arguments: Vec<String>) -> Result<Config, String> {
     let mut port = 8765;
     let mut tailscale_ip = None;
     let mut max_events = 1000;
+    let mut jules_bin =
+        env::var("JULES_BIN").unwrap_or_else(|_| jules::DEFAULT_JULES_BIN.to_owned());
     let mut values = arguments.into_iter();
     while let Some(argument) = values.next() {
         let value = |values: &mut std::vec::IntoIter<String>, name: &str| {
@@ -87,7 +94,8 @@ fn config(arguments: Vec<String>) -> Result<Config, String> {
                 tailscale_ip = Some(address);
             }
             "--max-events" => max_events = value(&mut values, "--max-events")?.parse().map_err(|_| "--max-events must be a positive integer".to_owned())?,
-            "--help" | "-h" => return Err("usage: relay --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000]".to_owned()),
+            "--jules-bin" => jules_bin = value(&mut values, "--jules-bin")?,
+            "--help" | "-h" => return Err("usage: relay --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000] [--jules-bin PATH]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -104,6 +112,7 @@ fn config(arguments: Vec<String>) -> Result<Config, String> {
         port,
         tailscale_ip,
         max_events,
+        jules_bin,
     })
 }
 
@@ -172,6 +181,7 @@ fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
     ) {
         ("POST", "/v1/events") => post(&mut stream, &state, request.body),
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
+        ("POST", "/v1/jules") => jules_exec(&mut stream, &state, request.body),
         _ => reply(&mut stream, 404, error("not_found")),
     }
 }
@@ -223,6 +233,38 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
         ),
         Err(_) => reply(stream, 500, error("could_not_persist_event")),
     }
+}
+
+fn jules_exec(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), String> {
+    let parsed = String::from_utf8(body)
+        .map_err(|_| "request body must be UTF-8".to_owned())
+        .and_then(|text| parse_json(&text).map_err(|error| format!("invalid JSON: {error}")));
+    let parsed = match parsed {
+        Ok(json) => json,
+        Err(message) => {
+            reply(stream, 400, error(&message))?;
+            return Ok(());
+        }
+    };
+    let request = match jules::parse_request(&parsed) {
+        Ok(request) => request,
+        Err(message) => {
+            reply(stream, 400, error(&message))?;
+            return Ok(());
+        }
+    };
+    // Log the id and subcommand only; dispatch prompts can be long.
+    eprintln!(
+        "jules exec id={} subcommand={}",
+        request.id,
+        request.args.first().map(String::as_str).unwrap_or("")
+    );
+    let result = jules::run(&state.jules_bin, request);
+    eprintln!(
+        "jules exec id={} exit_code={:?} timed_out={}",
+        result.id, result.exit_code, result.timed_out
+    );
+    reply(stream, 200, result.to_json())
 }
 
 fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), String> {
