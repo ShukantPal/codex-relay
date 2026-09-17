@@ -41,6 +41,34 @@ not be group/world readable and its content must be at least 32 bytes. For
 testing only, `--tailscale-ip` can set a specific Tailscale IPv4 address;
 ordinary operation discovers it using `tailscale ip -4`.
 
+The relay also accepts `--jules-bin` (or the `JULES_BIN` environment
+variable), defaulting to `/Users/shukant/.npm-global/bin/jules`.
+
+## Jules bridge
+
+The relay runs as a LaunchAgent inside the Mac's GUI login session, where the
+macOS keychain is available. `POST /v1/jules` runs an allowlisted `jules`
+subcommand there and returns its output synchronously, which lets callers
+without keychain access (such as SSH sessions) drive Jules:
+
+```sh
+curl -s http://100.101.237.83:8765/v1/jules \
+  -H "Authorization: Bearer $(cat ~/.codex/relay/relay.token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "list-repos-1", "args": ["remote", "list", "--repo"]}'
+```
+
+Only the `new` and `remote` (`list`, `pull`, `new`) subcommands are accepted;
+`login` and `logout` are never executed through the bridge, so it cannot
+change the CLI's auth state. There is no shell: arguments are passed directly
+to the fixed `jules` binary. Execution is capped at 300 seconds and 1 MiB of
+captured output per stream. The response looks like:
+
+```json
+{"id": "list-repos-1", "exit_code": 0, "stdout": "...", "stderr": "",
+ "truncated": false, "timed_out": false}
+```
+
 ## VM poller
 
 Provision an identical mode-600 token file using the existing secret-delivery
