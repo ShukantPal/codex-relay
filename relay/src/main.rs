@@ -12,7 +12,9 @@ use std::time::Duration;
 mod exec;
 
 const MAX_BODY: usize = 64 * 1024;
+#[cfg(any(target_os = "macos", test))]
 const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
+#[cfg(any(target_os = "macos", test))]
 const SESSION_IS_REMOTE: u32 = 0x1000;
 
 struct Config {
@@ -35,7 +37,7 @@ struct Request {
 
 enum ReadRequestError {
     Message(String),
-    ExecBodyTooLarge,
+    ExecDenied,
 }
 
 fn main() {
@@ -141,6 +143,7 @@ fn allowlist_file(arguments: &[String]) -> Result<&str, String> {
     Ok(file)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_local_gui_session(status: i32, attributes: u32) -> bool {
     status == 0
         && attributes & SESSION_HAS_GRAPHIC_ACCESS != 0
@@ -154,7 +157,7 @@ fn is_local_gui_session(status: i32, attributes: u32) -> bool {
 fn require_gui_login_session() -> Result<(), String> {
     const CALLER_SECURITY_SESSION: u32 = u32::MAX;
     #[link(name = "Security", kind = "framework")]
-    extern "C" {
+    unsafe extern "C" {
         fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
     }
 
@@ -214,7 +217,7 @@ fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
-        Err(ReadRequestError::ExecBodyTooLarge) => {
+        Err(ReadRequestError::ExecDenied) => {
             denied(&mut stream, "")?;
             return Ok(());
         }
@@ -310,15 +313,16 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
         request.bin,
         request.args.first().map(String::as_str).unwrap_or("")
     );
-    let policy = match exec::load_policy() {
+    let policy = match require_gui_login_session().and_then(|_| exec::load_policy()) {
         Ok(policy) => policy,
         Err(message) => {
             eprintln!("exec policy read failed: {message}");
             return reply(stream, 500, error("could_not_read_execution_policy"));
         }
     };
-    let Some(path) = policy.allowed_path(&request.bin, &request.args) else {
-        return denied(stream, &request.id);
+    let path = match policy_path_or_denial(&policy, &request) {
+        Ok(path) => path,
+        Err(denial) => return reply(stream, 200, denial),
     };
     let result = exec::run(path, request);
     reply(stream, 200, result.to_json())
@@ -336,7 +340,21 @@ fn parse_exec_request(body: &[u8]) -> Result<exec::ExecRequest, Json> {
 }
 
 fn denied(stream: &mut TcpStream, id: &str) -> Result<(), String> {
-    reply(stream, 200, denial_json(id))
+    let (status, body) = denial_response(id);
+    reply(stream, status, body)
+}
+
+fn policy_path_or_denial<'a>(
+    policy: &'a exec::Policy,
+    request: &exec::ExecRequest,
+) -> Result<&'a str, Json> {
+    policy
+        .allowed_path(&request.bin, &request.args)
+        .ok_or_else(|| denial_json(&request.id))
+}
+
+fn denial_response(id: &str) -> (u16, Json) {
+    (200, denial_json(id))
 }
 
 fn denial_json(id: &str) -> Json {
@@ -450,16 +468,20 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
     })?;
     if length > MAX_BODY {
         if method == "POST" && target.split('?').next() == Some("/v1/exec") {
-            return Err(ReadRequestError::ExecBodyTooLarge);
+            return Err(ReadRequestError::ExecDenied);
         }
         return Err(ReadRequestError::Message(
             "request body too large".to_owned(),
         ));
     }
     let mut body = vec![0; length];
-    reader
-        .read_exact(&mut body)
-        .map_err(|_| ReadRequestError::Message("short request body".to_owned()))?;
+    reader.read_exact(&mut body).map_err(|_| {
+        if method == "POST" && target.split('?').next() == Some("/v1/exec") {
+            ReadRequestError::ExecDenied
+        } else {
+            ReadRequestError::Message("short request body".to_owned())
+        }
+    })?;
     Ok(Request {
         method,
         target,
@@ -610,7 +632,10 @@ mod tests {
     fn exec_denials_are_opaque_and_never_include_policy_data() {
         let expected = r#"{"id":"request-1","error":"denied"}"#;
         let malformed =
-            parse_exec_request(br#"{"id":"request-1","bin":"jules","args":["new"]"#).unwrap_err();
+            match parse_exec_request(br#"{"id":"request-1","bin":"jules","args":["new"]"#) {
+                Err(denial) => denial,
+                Ok(_) => panic!("malformed request was accepted"),
+            };
         assert_eq!(malformed.to_json(), expected);
 
         let policy = exec::Policy::parse(
@@ -622,10 +647,14 @@ mod tests {
             br#"{"id":"request-1","bin":"jules","args":["login"]}"#.as_slice(),
         ] {
             let request = parse_exec_request(body).unwrap();
-            assert!(policy.allowed_path(&request.bin, &request.args).is_none());
-            let denial = denial_json(&request.id).to_json();
+            let denial = policy_path_or_denial(&policy, &request)
+                .unwrap_err()
+                .to_json();
             assert_eq!(denial, expected);
             assert!(!denial.contains("configured-binary"));
+            let (status, response) = denial_response(&request.id);
+            assert_eq!(status, 200);
+            assert_eq!(response.to_json(), expected);
         }
     }
 
@@ -646,7 +675,27 @@ mod tests {
         client.join().unwrap();
         assert!(matches!(
             read_request(&mut server),
-            Err(ReadRequestError::ExecBodyTooLarge)
+            Err(ReadRequestError::ExecDenied)
+        ));
+    }
+
+    #[test]
+    fn truncated_exec_request_is_an_opaque_denial() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(
+                stream,
+                "POST /v1/exec HTTP/1.1\r\nContent-Length: 1\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        assert!(matches!(
+            read_request(&mut server),
+            Err(ReadRequestError::ExecDenied)
         ));
     }
 }
