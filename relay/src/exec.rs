@@ -318,7 +318,12 @@ fn run_with_timeout(path: &str, request: ExecRequest, timeout: Duration) -> Exec
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => break false,
+            Err(error) => {
+                eprintln!("exec child wait failed: {error}");
+                let _ = child.kill();
+                let _ = child.wait();
+                break true;
+            }
         }
     };
     let (stdout, stdout_truncated) = stdout_reader.join().unwrap_or_default();
@@ -451,6 +456,30 @@ mod tests {
             ),
         ]);
         assert!(parse_request(&too_long).is_err());
+    }
+
+    #[test]
+    fn request_validation_enforces_argument_and_id_byte_boundaries() {
+        let make_request = |id: String, argument_count: usize| {
+            Json::Object(vec![
+                ("id".to_owned(), Json::String(id)),
+                ("bin".to_owned(), Json::String("jules".to_owned())),
+                (
+                    "args".to_owned(),
+                    Json::Array(
+                        (0..argument_count)
+                            .map(|_| Json::String("x".to_owned()))
+                            .collect(),
+                    ),
+                ),
+            ])
+        };
+        assert!(parse_request(&make_request("x".repeat(MAX_ID_BYTES), MAX_ARGS)).is_ok());
+        assert!(parse_request(&make_request("x".repeat(MAX_ID_BYTES + 1), MAX_ARGS)).is_err());
+        assert!(
+            parse_request(&make_request("x".repeat(MAX_ID_BYTES - 1) + "é", MAX_ARGS)).is_err()
+        );
+        assert!(parse_request(&make_request("request".to_owned(), MAX_ARGS + 1)).is_err());
     }
 
     #[test]

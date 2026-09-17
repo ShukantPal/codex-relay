@@ -55,6 +55,8 @@ policy in a file and running:
 relay config set-allowlist --file /secure/path/exec-allowlist.json
 ```
 
+The updater verifies that it is in a local graphical macOS session and refuses
+to run from SSH, so the Keychain write remains an owner GUI-session operation.
 The command validates the policy, stores canonical JSON in the `codex-relay` /
 `exec-allowlist` Keychain item, then prints the stored normalized policy for
 confirmation. macOS may prompt once to grant this specific relay binary

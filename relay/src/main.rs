@@ -12,6 +12,8 @@ use std::time::Duration;
 mod exec;
 
 const MAX_BODY: usize = 64 * 1024;
+const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
+const SESSION_IS_REMOTE: u32 = 0x1000;
 
 struct Config {
     secret_file: PathBuf,
@@ -29,6 +31,11 @@ struct Request {
     target: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+}
+
+enum ReadRequestError {
+    Message(String),
+    ExecBodyTooLarge,
 }
 
 fn main() {
@@ -114,18 +121,58 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
 }
 
 fn run_config(arguments: &[String]) -> Result<(), String> {
-    let [command, flag, file] = arguments else {
-        return Err("usage: relay config set-allowlist --file PATH".to_owned());
-    };
-    if command != "set-allowlist" || flag != "--file" || file.is_empty() {
-        return Err("usage: relay config set-allowlist --file PATH".to_owned());
-    }
+    require_gui_login_session()?;
+    let file = allowlist_file(arguments)?;
     let contents = std::fs::read_to_string(file)
         .map_err(|error| format!("could not read allowlist file {file}: {error}"))?;
     let policy = exec::Policy::parse(&contents)?;
     exec::store_policy(&policy)?;
     println!("{}", policy.canonical_json());
     Ok(())
+}
+
+fn allowlist_file(arguments: &[String]) -> Result<&str, String> {
+    let [command, flag, file] = arguments else {
+        return Err("usage: relay config set-allowlist --file PATH".to_owned());
+    };
+    if command != "set-allowlist" || flag != "--file" || file.is_empty() {
+        return Err("usage: relay config set-allowlist --file PATH".to_owned());
+    }
+    Ok(file)
+}
+
+fn is_local_gui_session(status: i32, attributes: u32) -> bool {
+    status == 0
+        && attributes & SESSION_HAS_GRAPHIC_ACCESS != 0
+        && attributes & SESSION_IS_REMOTE == 0
+}
+
+/// Policy updates are intentionally an owner action from the local Aqua
+/// session, never an SSH action. Keychain access alone does not establish
+/// which terminal invoked this executable, so check the caller's session too.
+#[cfg(target_os = "macos")]
+fn require_gui_login_session() -> Result<(), String> {
+    const CALLER_SECURITY_SESSION: u32 = u32::MAX;
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
+    }
+
+    let mut session_id = 0;
+    let mut attributes = 0;
+    // `callerSecuritySession` asks macOS about this process's session.
+    let status =
+        unsafe { SessionGetInfo(CALLER_SECURITY_SESSION, &mut session_id, &mut attributes) };
+    if is_local_gui_session(status, attributes) {
+        Ok(())
+    } else {
+        Err("set-allowlist must run from Shukant's local macOS GUI login session".to_owned())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn require_gui_login_session() -> Result<(), String> {
+    Err("set-allowlist must run from Shukant's local macOS GUI login session".to_owned())
 }
 
 fn resolve_tailscale_ip() -> Result<IpAddr, String> {
@@ -167,7 +214,11 @@ fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
-        Err(error) => {
+        Err(ReadRequestError::ExecBodyTooLarge) => {
+            denied(&mut stream, "")?;
+            return Ok(());
+        }
+        Err(ReadRequestError::Message(error)) => {
             reply(
                 &mut stream,
                 400,
@@ -248,16 +299,9 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
 }
 
 fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
-    let parsed = String::from_utf8(body)
-        .ok()
-        .and_then(|text| parse_json(&text).ok());
-    let Some(parsed) = parsed else {
-        return denied(stream, "");
-    };
-    let denied_id = exec::request_id(&parsed);
-    let request = match exec::parse_request(&parsed) {
+    let request = match parse_exec_request(&body) {
         Ok(request) => request,
-        Err(_) => return denied(stream, &denied_id),
+        Err(denial) => return reply(stream, 200, denial),
     };
     // Prompts can be sensitive, so logs contain only this minimal routing data.
     eprintln!(
@@ -280,15 +324,26 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
     reply(stream, 200, result.to_json())
 }
 
+fn parse_exec_request(body: &[u8]) -> Result<exec::ExecRequest, Json> {
+    let parsed = std::str::from_utf8(body)
+        .ok()
+        .and_then(|text| parse_json(&text).ok());
+    let Some(parsed) = parsed else {
+        return Err(denial_json(""));
+    };
+    let denied_id = exec::request_id(&parsed);
+    exec::parse_request(&parsed).map_err(|_| denial_json(&denied_id))
+}
+
 fn denied(stream: &mut TcpStream, id: &str) -> Result<(), String> {
-    reply(
-        stream,
-        200,
-        Json::Object(vec![
-            ("id".to_owned(), Json::String(id.to_owned())),
-            ("error".to_owned(), Json::String("denied".to_owned())),
-        ]),
-    )
+    reply(stream, 200, denial_json(id))
+}
+
+fn denial_json(id: &str) -> Json {
+    Json::Object(vec![
+        ("id".to_owned(), Json::String(id.to_owned())),
+        ("error".to_owned(), Json::String("denied".to_owned())),
+    ])
 }
 
 fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), String> {
@@ -353,51 +408,58 @@ fn read_json(result: ReadResult) -> Json {
     ])
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
+fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
     let mut reader = BufReader::new(stream);
     let mut first = String::new();
     reader
         .read_line(&mut first)
-        .map_err(|_| "could not read request line".to_owned())?;
+        .map_err(|_| ReadRequestError::Message("could not read request line".to_owned()))?;
     let mut parts = first.split_whitespace();
     let method = parts
         .next()
-        .ok_or_else(|| "malformed request line".to_owned())?
+        .ok_or_else(|| ReadRequestError::Message("malformed request line".to_owned()))?
         .to_owned();
     let target = parts
         .next()
-        .ok_or_else(|| "malformed request line".to_owned())?
+        .ok_or_else(|| ReadRequestError::Message("malformed request line".to_owned()))?
         .to_owned();
     if parts.next().is_none() {
-        return Err("malformed request line".to_owned());
+        return Err(ReadRequestError::Message(
+            "malformed request line".to_owned(),
+        ));
     }
     let mut headers = HashMap::new();
     loop {
         let mut line = String::new();
         reader
             .read_line(&mut line)
-            .map_err(|_| "could not read headers".to_owned())?;
+            .map_err(|_| ReadRequestError::Message("could not read headers".to_owned()))?;
         if line == "\r\n" || line == "\n" {
             break;
         }
         let (name, value) = line
             .trim_end()
             .split_once(':')
-            .ok_or_else(|| "malformed header".to_owned())?;
+            .ok_or_else(|| ReadRequestError::Message("malformed header".to_owned()))?;
         headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
     }
     let length = headers.get("content-length").map_or(Ok(0), |value| {
         value
             .parse::<usize>()
-            .map_err(|_| "invalid content length".to_owned())
+            .map_err(|_| ReadRequestError::Message("invalid content length".to_owned()))
     })?;
     if length > MAX_BODY {
-        return Err("request body too large".to_owned());
+        if method == "POST" && target.split('?').next() == Some("/v1/exec") {
+            return Err(ReadRequestError::ExecBodyTooLarge);
+        }
+        return Err(ReadRequestError::Message(
+            "request body too large".to_owned(),
+        ));
     }
     let mut body = vec![0; length];
     reader
         .read_exact(&mut body)
-        .map_err(|_| "short request body".to_owned())?;
+        .map_err(|_| ReadRequestError::Message("short request body".to_owned()))?;
     Ok(Request {
         method,
         target,
@@ -504,5 +566,87 @@ mod tests {
         assert!(is_tailscale_ipv4("100.101.237.83".parse().unwrap()));
         assert!(!is_tailscale_ipv4("0.0.0.0".parse().unwrap()));
         assert!(!is_tailscale_ipv4("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn allowlist_updater_accepts_only_its_exact_arguments() {
+        let valid = vec![
+            "set-allowlist".to_owned(),
+            "--file".to_owned(),
+            "/secure/policy.json".to_owned(),
+        ];
+        assert_eq!(allowlist_file(&valid).unwrap(), "/secure/policy.json");
+        for invalid in [
+            vec![],
+            vec!["set-allowlist".to_owned()],
+            vec!["set-allowlist".to_owned(), "--file".to_owned()],
+            vec![
+                "set-allowlist".to_owned(),
+                "--other".to_owned(),
+                "/secure/policy.json".to_owned(),
+            ],
+            vec![
+                "set-allowlist".to_owned(),
+                "--file".to_owned(),
+                "".to_owned(),
+            ],
+        ] {
+            assert!(allowlist_file(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn gui_session_check_rejects_remote_or_non_graphical_sessions() {
+        assert!(is_local_gui_session(0, SESSION_HAS_GRAPHIC_ACCESS));
+        assert!(!is_local_gui_session(
+            0,
+            SESSION_HAS_GRAPHIC_ACCESS | SESSION_IS_REMOTE
+        ));
+        assert!(!is_local_gui_session(0, 0));
+        assert!(!is_local_gui_session(-1, SESSION_HAS_GRAPHIC_ACCESS));
+    }
+
+    #[test]
+    fn exec_denials_are_opaque_and_never_include_policy_data() {
+        let expected = r#"{"id":"request-1","error":"denied"}"#;
+        let malformed =
+            parse_exec_request(br#"{"id":"request-1","bin":"jules","args":["new"]"#).unwrap_err();
+        assert_eq!(malformed.to_json(), expected);
+
+        let policy = exec::Policy::parse(
+            r#"{"bins":{"jules":{"path":"/private/configured-binary","commands":[["new"]]}}}"#,
+        )
+        .unwrap();
+        for body in [
+            br#"{"id":"request-1","bin":"unknown","args":["new"]}"#.as_slice(),
+            br#"{"id":"request-1","bin":"jules","args":["login"]}"#.as_slice(),
+        ] {
+            let request = parse_exec_request(body).unwrap();
+            assert!(policy.allowed_path(&request.bin, &request.args).is_none());
+            let denial = denial_json(&request.id).to_json();
+            assert_eq!(denial, expected);
+            assert!(!denial.contains("configured-binary"));
+        }
+    }
+
+    #[test]
+    fn oversized_exec_request_is_an_opaque_denial_before_body_allocation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(
+                stream,
+                "POST /v1/exec HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_BODY + 1
+            )
+            .unwrap();
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        assert!(matches!(
+            read_request(&mut server),
+            Err(ReadRequestError::ExecBodyTooLarge)
+        ));
     }
 }
