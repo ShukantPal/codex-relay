@@ -41,32 +41,53 @@ not be group/world readable and its content must be at least 32 bytes. For
 testing only, `--tailscale-ip` can set a specific Tailscale IPv4 address;
 ordinary operation discovers it using `tailscale ip -4`.
 
-The relay also accepts `--jules-bin` (or the `JULES_BIN` environment
-variable), defaulting to `/Users/shukant/.npm-global/bin/jules`.
-
-## Jules bridge
+## Exec endpoint
 
 The relay runs as a LaunchAgent inside the Mac's GUI login session, where the
-macOS keychain is available. `POST /v1/jules` runs an allowlisted `jules`
-subcommand there and returns its output synchronously, which lets callers
-without keychain access (such as SSH sessions) drive Jules:
+macOS keychain is available. Its `POST /v1/exec` endpoint executes only a
+binary and argv prefix named in the Keychain-held policy. SSH sessions cannot
+read or modify that policy.
+
+Shukant installs or updates it from his GUI login session by putting the JSON
+policy in a file and running:
 
 ```sh
-curl -s http://100.101.237.83:8765/v1/jules \
-  -H "Authorization: Bearer $(cat ~/.codex/relay/relay.token)" \
-  -H 'Content-Type: application/json' \
-  -d '{"id": "list-repos-1", "args": ["remote", "list", "--repo"]}'
+relay config set-allowlist --file /secure/path/exec-allowlist.json
 ```
 
-Only the `new` and `remote` (`list`, `pull`, `new`) subcommands are accepted;
-`login` and `logout` are never executed through the bridge, so it cannot
-change the CLI's auth state. There is no shell: arguments are passed directly
-to the fixed `jules` binary. Execution is capped at 300 seconds and 1 MiB of
-captured output per stream. The response looks like:
+The relay verifies that it is in a local graphical macOS session before either
+reading or writing the policy, and refuses those operations from SSH. This
+keeps Keychain policy access within the owner GUI-login session.
+The command validates the policy, stores canonical JSON in the `codex-relay` /
+`exec-allowlist` Keychain item, then prints the stored normalized policy for
+confirmation. macOS may prompt once to grant this specific relay binary
+"Always Allow" access to the Keychain item; accept that prompt only after
+verifying the binary is the reviewed relay build.
+
+For an allowed operation, a caller uses the configured binary short name
+rather than a caller-supplied path:
+
+```sh
+curl -s http://100.101.237.83:8765/v1/exec \
+  -H "Authorization: Bearer $(cat ~/.codex/relay/relay.token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "list-repos-1", "bin": "jules", "args": ["remote", "list", "--repo"]}'
+```
+
+There is no shell or PATH lookup: arguments are passed directly to the absolute
+path from policy. Execution is capped at 300 seconds and 1 MiB of captured
+output per stream. A successful response looks like:
 
 ```json
 {"id": "list-repos-1", "exit_code": 0, "stdout": "...", "stderr": "",
  "truncated": false, "timed_out": false}
+```
+
+Unknown binary names, disallowed prefixes, and malformed request bodies all
+return the same opaque denial response (with the submitted id when usable):
+
+```json
+{"id": "list-repos-1", "error": "denied"}
 ```
 
 ## VM poller
