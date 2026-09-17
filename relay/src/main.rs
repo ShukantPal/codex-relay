@@ -331,7 +331,7 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
 fn parse_exec_request(body: &[u8]) -> Result<exec::ExecRequest, Json> {
     let parsed = std::str::from_utf8(body)
         .ok()
-        .and_then(|text| parse_json(&text).ok());
+        .and_then(|text| parse_json(text).ok());
     let Some(parsed) = parsed else {
         return Err(denial_json(""));
     };
