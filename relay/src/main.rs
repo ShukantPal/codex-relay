@@ -631,12 +631,18 @@ mod tests {
     #[test]
     fn exec_denials_are_opaque_and_never_include_policy_data() {
         let expected = r#"{"id":"request-1","error":"denied"}"#;
-        let malformed =
+        let invalid_json =
             match parse_exec_request(br#"{"id":"request-1","bin":"jules","args":["new"]"#) {
                 Err(denial) => denial,
                 Ok(_) => panic!("malformed request was accepted"),
             };
-        assert_eq!(malformed.to_json(), expected);
+        assert_eq!(invalid_json.to_json(), r#"{"id":"","error":"denied"}"#);
+        let malformed_schema =
+            match parse_exec_request(br#"{"id":"request-1","bin":"jules","args":"new"}"#) {
+                Err(denial) => denial,
+                Ok(_) => panic!("malformed request was accepted"),
+            };
+        assert_eq!(malformed_schema.to_json(), expected);
 
         let policy = exec::Policy::parse(
             r#"{"bins":{"jules":{"path":"/private/configured-binary","commands":[["new"]]}}}"#,
