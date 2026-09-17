@@ -64,8 +64,8 @@ confirmation. macOS may prompt once to grant this specific relay binary
 "Always Allow" access to the Keychain item; accept that prompt only after
 verifying the binary is the reviewed relay build.
 
-For an allowed Jules operation, a caller uses the binary short name rather
-than a caller-supplied path:
+For an allowed operation, a caller uses the configured binary short name
+rather than a caller-supplied path:
 
 ```sh
 curl -s http://100.101.237.83:8765/v1/exec \
@@ -89,9 +89,6 @@ return the same opaque denial response (with the submitted id when usable):
 ```json
 {"id": "list-repos-1", "error": "denied"}
 ```
-
-`POST /v1/jules`, `--jules-bin`, and `JULES_BIN` were removed; update callers
-to use this endpoint and Keychain policy.
 
 ## VM poller
 
