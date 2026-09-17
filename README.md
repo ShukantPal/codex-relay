@@ -22,6 +22,42 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+## Release signing and deploy (Mac)
+
+Every `cargo build` re-generates the binary's ad-hoc signature (new
+identifier, new cdhash), so the keychain treats each rebuild as a different
+app and re-prompts for allowlist access. Sign every release build with a
+stable certificate identity instead:
+
+```sh
+./scripts/sign-release.sh
+```
+
+This builds, signs with `Apple Development: Shukant Pal` under the fixed
+identifier `com.shukantpal.zigzag`, verifies, and restarts the LaunchAgent.
+Run it in an interactive Mac terminal, never over SSH: code signing needs
+the login keychain, and restarting the LaunchAgent from SSH puts the daemon
+in the wrong macOS security session (its keychain reads hang and `/v1/exec`
+stops responding). The script refuses to run over SSH.
+
+The first run after switching to stable signing triggers one keychain
+prompt when the daemon first reads the allowlist; choose **Always Allow**
+so all future rebuilds keep working with no further prompts.
+
+### Allowlist management
+
+```sh
+# Read the current policy (GUI session only)
+zigzag config get-allowlist
+# Replace the entire policy with the JSON in FILE (GUI session only).
+# This REPLACES, not merges: export first, edit, then set.
+zigzag config set-allowlist --file /path/to/policy.json
+```
+
+Policy JSON shape: `{"bins": {"<name>": {"path": "/abs/path", "commands": [["sub", "..."]], ...}}}`.
+`commands` entries are argv prefixes. The `gh` bin also accepts
+`"gh_read_repos": ["owner/repo"]` to scope `gh api` / `pr` commands.
+
 ## Linux VM build
 
 The poller uses only the Rust standard library. Cross-compile for the VM after

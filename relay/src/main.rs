@@ -256,6 +256,11 @@ fn parse_github_open_pull_requests(output: &str) -> Result<Vec<(u64, String)>, S
 
 fn run_config(arguments: &[String]) -> Result<(), String> {
     require_gui_login_session()?;
+    if is_get_allowlist(arguments) {
+        let policy = exec::load_policy()?;
+        println!("{}", policy.canonical_json());
+        return Ok(());
+    }
     let file = allowlist_file(arguments)?;
     let contents = std::fs::read_to_string(file)
         .map_err(|error| format!("could not read allowlist file {file}: {error}"))?;
@@ -265,12 +270,16 @@ fn run_config(arguments: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn is_get_allowlist(arguments: &[String]) -> bool {
+    arguments.len() == 1 && arguments[0] == "get-allowlist"
+}
+
 fn allowlist_file(arguments: &[String]) -> Result<&str, String> {
     let [command, flag, file] = arguments else {
-        return Err("usage: zigzag config set-allowlist --file PATH".to_owned());
+        return Err("usage: zigzag config (get-allowlist | set-allowlist --file PATH)".to_owned());
     };
     if command != "set-allowlist" || flag != "--file" || file.is_empty() {
-        return Err("usage: zigzag config set-allowlist --file PATH".to_owned());
+        return Err("usage: zigzag config (get-allowlist | set-allowlist --file PATH)".to_owned());
     }
     Ok(file)
 }
@@ -720,6 +729,18 @@ mod tests {
         assert!(is_tailscale_ipv4("100.101.237.83".parse().unwrap()));
         assert!(!is_tailscale_ipv4("0.0.0.0".parse().unwrap()));
         assert!(!is_tailscale_ipv4("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn get_allowlist_matches_only_its_exact_arguments() {
+        assert!(is_get_allowlist(&["get-allowlist".to_owned()]));
+        for invalid in [
+            Vec::new(),
+            vec!["get-allowlist".to_owned(), "--file".to_owned()],
+            vec!["set-allowlist".to_owned()],
+        ] {
+            assert!(!is_get_allowlist(&invalid));
+        }
     }
 
     #[test]
