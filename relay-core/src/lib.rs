@@ -1,4 +1,4 @@
-//! Shared durable queue and deliberately small JSON support for the relay.
+//! Shared durable queue and deliberately small JSON support for Zigzag.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -531,7 +531,7 @@ impl Store {
         fs::create_dir_all(parent)
             .map_err(|error| format!("could not create state directory: {error}"))?;
         let temporary = parent.join(format!(
-            ".relay-{}-{}-{}.tmp",
+            ".zigzag-{}-{}-{}.tmp",
             std::process::id(),
             inner.next_sequence,
             TEMPORARY_FILE_SERIAL.fetch_add(1, Ordering::Relaxed)
@@ -696,7 +696,7 @@ mod tests {
 
     fn path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "codex-relay-{name}-{}-{}.json",
+            "zigzag-{name}-{}-{}.json",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

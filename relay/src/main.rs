@@ -42,7 +42,7 @@ enum ReadRequestError {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("relay: {error}");
+        eprintln!("zigzag: {error}");
         std::process::exit(1);
     }
 }
@@ -67,7 +67,7 @@ fn run() -> Result<(), String> {
         let listener = TcpListener::bind(address)
             .map_err(|error| format!("could not bind {address}: {error}"))?;
         let state = Arc::clone(&state);
-        println!("relay listening on http://{address}");
+        println!("zigzag listening on http://{address}");
         thread::spawn(move || serve(listener, state));
     }
     loop {
@@ -76,8 +76,8 @@ fn run() -> Result<(), String> {
 }
 
 fn server_config(arguments: Vec<String>) -> Result<Config, String> {
-    let mut secret_file = env::var_os("RELAY_SECRET_FILE").map(PathBuf::from);
-    let mut state_file = env::var_os("RELAY_STATE_FILE").map(PathBuf::from);
+    let mut secret_file = env::var_os("ZIGZAG_SECRET_FILE").map(PathBuf::from);
+    let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);
     let mut port = 8765;
     let mut tailscale_ip = None;
     let mut max_events = 1000;
@@ -102,14 +102,14 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
                 tailscale_ip = Some(address);
             }
             "--max-events" => max_events = value(&mut values, "--max-events")?.parse().map_err(|_| "--max-events must be a positive integer".to_owned())?,
-            "--help" | "-h" => return Err("usage: relay --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000]".to_owned()),
+            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
     let secret_file =
-        secret_file.ok_or_else(|| "--secret-file or RELAY_SECRET_FILE is required".to_owned())?;
+        secret_file.ok_or_else(|| "--secret-file or ZIGZAG_SECRET_FILE is required".to_owned())?;
     let state_file =
-        state_file.ok_or_else(|| "--state-file or RELAY_STATE_FILE is required".to_owned())?;
+        state_file.ok_or_else(|| "--state-file or ZIGZAG_STATE_FILE is required".to_owned())?;
     if max_events == 0 {
         return Err("--max-events must be greater than zero".to_owned());
     }
@@ -135,10 +135,10 @@ fn run_config(arguments: &[String]) -> Result<(), String> {
 
 fn allowlist_file(arguments: &[String]) -> Result<&str, String> {
     let [command, flag, file] = arguments else {
-        return Err("usage: relay config set-allowlist --file PATH".to_owned());
+        return Err("usage: zigzag config set-allowlist --file PATH".to_owned());
     };
     if command != "set-allowlist" || flag != "--file" || file.is_empty() {
-        return Err("usage: relay config set-allowlist --file PATH".to_owned());
+        return Err("usage: zigzag config set-allowlist --file PATH".to_owned());
     }
     Ok(file)
 }
@@ -181,7 +181,7 @@ fn require_gui_login_session() -> Result<(), String> {
 fn resolve_tailscale_ip() -> Result<IpAddr, String> {
     let output = Command::new("tailscale").args(["ip", "-4"]).output().map_err(|error| format!("could not run tailscale ip -4: {error}; use --tailscale-ip only for explicit test/development overrides"))?;
     if !output.status.success() {
-        return Err("tailscale ip -4 failed; relay will not bind broadly".to_owned());
+        return Err("tailscale ip -4 failed; Zigzag will not bind broadly".to_owned());
     }
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| "tailscale ip -4 produced non-UTF-8 output".to_owned())?;
@@ -206,7 +206,7 @@ fn serve(listener: TcpListener, state: Arc<Server>) {
                     let _ = handle(stream, state);
                 });
             }
-            Err(error) => eprintln!("relay accept error: {error}"),
+            Err(error) => eprintln!("zigzag accept error: {error}"),
         }
     }
 }
