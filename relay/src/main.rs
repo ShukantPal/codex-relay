@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-mod jules;
+mod exec;
 
 const MAX_BODY: usize = 64 * 1024;
 
@@ -19,12 +19,10 @@ struct Config {
     port: u16,
     tailscale_ip: Option<IpAddr>,
     max_events: usize,
-    jules_bin: String,
 }
 struct Server {
     secret: String,
     store: Store,
-    jules_bin: String,
 }
 struct Request {
     method: String,
@@ -41,12 +39,15 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let config = config(env::args().skip(1).collect())?;
+    let arguments: Vec<_> = env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("config") {
+        return run_config(&arguments[1..]);
+    }
+    let config = server_config(arguments)?;
     let secret = read_secret_file(&config.secret_file)?;
     let state = Arc::new(Server {
         secret,
         store: Store::open(config.state_file, config.max_events)?,
-        jules_bin: config.jules_bin,
     });
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
@@ -65,14 +66,12 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn config(arguments: Vec<String>) -> Result<Config, String> {
+fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut secret_file = env::var_os("RELAY_SECRET_FILE").map(PathBuf::from);
     let mut state_file = env::var_os("RELAY_STATE_FILE").map(PathBuf::from);
     let mut port = 8765;
     let mut tailscale_ip = None;
     let mut max_events = 1000;
-    let mut jules_bin =
-        env::var("JULES_BIN").unwrap_or_else(|_| jules::DEFAULT_JULES_BIN.to_owned());
     let mut values = arguments.into_iter();
     while let Some(argument) = values.next() {
         let value = |values: &mut std::vec::IntoIter<String>, name: &str| {
@@ -94,8 +93,7 @@ fn config(arguments: Vec<String>) -> Result<Config, String> {
                 tailscale_ip = Some(address);
             }
             "--max-events" => max_events = value(&mut values, "--max-events")?.parse().map_err(|_| "--max-events must be a positive integer".to_owned())?,
-            "--jules-bin" => jules_bin = value(&mut values, "--jules-bin")?,
-            "--help" | "-h" => return Err("usage: relay --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000] [--jules-bin PATH]".to_owned()),
+            "--help" | "-h" => return Err("usage: relay --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -112,8 +110,22 @@ fn config(arguments: Vec<String>) -> Result<Config, String> {
         port,
         tailscale_ip,
         max_events,
-        jules_bin,
     })
+}
+
+fn run_config(arguments: &[String]) -> Result<(), String> {
+    let [command, flag, file] = arguments else {
+        return Err("usage: relay config set-allowlist --file PATH".to_owned());
+    };
+    if command != "set-allowlist" || flag != "--file" || file.is_empty() {
+        return Err("usage: relay config set-allowlist --file PATH".to_owned());
+    }
+    let contents = std::fs::read_to_string(file)
+        .map_err(|error| format!("could not read allowlist file {file}: {error}"))?;
+    let policy = exec::Policy::parse(&contents)?;
+    exec::store_policy(&policy)?;
+    println!("{}", policy.canonical_json());
+    Ok(())
 }
 
 fn resolve_tailscale_ip() -> Result<IpAddr, String> {
@@ -181,7 +193,7 @@ fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
     ) {
         ("POST", "/v1/events") => post(&mut stream, &state, request.body),
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
-        ("POST", "/v1/jules") => jules_exec(&mut stream, &state, request.body),
+        ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
         _ => reply(&mut stream, 404, error("not_found")),
     }
 }
@@ -235,36 +247,48 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
     }
 }
 
-fn jules_exec(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), String> {
+fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
     let parsed = String::from_utf8(body)
-        .map_err(|_| "request body must be UTF-8".to_owned())
-        .and_then(|text| parse_json(&text).map_err(|error| format!("invalid JSON: {error}")));
-    let parsed = match parsed {
-        Ok(json) => json,
-        Err(message) => {
-            reply(stream, 400, error(&message))?;
-            return Ok(());
-        }
+        .ok()
+        .and_then(|text| parse_json(&text).ok());
+    let Some(parsed) = parsed else {
+        return denied(stream, "");
     };
-    let request = match jules::parse_request(&parsed) {
+    let denied_id = exec::request_id(&parsed);
+    let request = match exec::parse_request(&parsed) {
         Ok(request) => request,
-        Err(message) => {
-            reply(stream, 400, error(&message))?;
-            return Ok(());
-        }
+        Err(_) => return denied(stream, &denied_id),
     };
-    // Log the id and subcommand only; dispatch prompts can be long.
+    // Prompts can be sensitive, so logs contain only this minimal routing data.
     eprintln!(
-        "jules exec id={} subcommand={}",
+        "exec id={} bin={} subcommand={}",
         request.id,
+        request.bin,
         request.args.first().map(String::as_str).unwrap_or("")
     );
-    let result = jules::run(&state.jules_bin, request);
-    eprintln!(
-        "jules exec id={} exit_code={:?} timed_out={}",
-        result.id, result.exit_code, result.timed_out
-    );
+    let policy = match exec::load_policy() {
+        Ok(policy) => policy,
+        Err(message) => {
+            eprintln!("exec policy read failed: {message}");
+            return reply(stream, 500, error("could_not_read_execution_policy"));
+        }
+    };
+    let Some(path) = policy.allowed_path(&request.bin, &request.args) else {
+        return denied(stream, &request.id);
+    };
+    let result = exec::run(path, request);
     reply(stream, 200, result.to_json())
+}
+
+fn denied(stream: &mut TcpStream, id: &str) -> Result<(), String> {
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(id.to_owned())),
+            ("error".to_owned(), Json::String("denied".to_owned())),
+        ]),
+    )
 }
 
 fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), String> {
