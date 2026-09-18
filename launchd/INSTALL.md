@@ -190,7 +190,8 @@ returns immediately with a 128-bit hexadecimal process handle. Use
 `POST /v1/proc/<handle>/kill` to terminate a still-running process group.
 Output follows the same 1 MiB-per-stream limit as `/v1/exec`; completed
 process records are retained for up to one hour (with at most 128 retained).
-The relay does not restore process records after a restart.
+The relay terminates tracked process groups during normal shutdown and does not
+restore process records after a restart.
 
 ## VM poller
 
