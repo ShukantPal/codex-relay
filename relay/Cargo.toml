@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 keyring = { version = "3.6", features = ["apple-native"] }
+libc = "0.2"
 relay-core = { path = "../relay-core" }
