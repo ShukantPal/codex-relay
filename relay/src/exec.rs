@@ -18,7 +18,7 @@ const KEYCHAIN_ACCOUNT: &str = "exec-allowlist";
 /// Upper bound for one synchronous execution; the HTTP client must allow a
 /// slightly larger read timeout.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(300);
-const OUTPUT_CAP: usize = 1024 * 1024;
+pub const OUTPUT_CAP: usize = 1024 * 1024;
 const MAX_ARGS: usize = 64;
 const MAX_ARGS_BYTES: usize = 8 * 1024;
 const MAX_ID_BYTES: usize = 128;

@@ -3,15 +3,18 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod exec;
 
 const MAX_BODY: usize = 64 * 1024;
+const MAX_FINISHED_PROCS: usize = 128;
+const FINISHED_PROC_RETENTION: Duration = Duration::from_secs(60 * 60);
 #[cfg(any(target_os = "macos", test))]
 const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
 #[cfg(any(target_os = "macos", test))]
@@ -29,6 +32,57 @@ struct Config {
 struct Server {
     secret: String,
     store: Store,
+    procs: Mutex<HashMap<String, ProcEntry>>,
+}
+
+struct ProcEntry {
+    child: Child,
+    process_group: i32,
+    id: String,
+    bin: String,
+    subcommand: String,
+    spawned_at: Instant,
+    finished_at: Option<Instant>,
+    leader_reaped: bool,
+    exit_code: Option<i32>,
+    stdout: Arc<Mutex<CappedOutput>>,
+    stderr: Arc<Mutex<CappedOutput>>,
+}
+
+#[derive(Default)]
+struct CappedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    complete: bool,
+}
+
+impl Drop for ProcEntry {
+    fn drop(&mut self) {
+        if self.finished_at.is_none() {
+            let _ = kill_process_group(self.process_group);
+        }
+    }
+}
+
+impl CappedOutput {
+    fn append(&mut self, bytes: &[u8]) {
+        let room = exec::OUTPUT_CAP.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
+        self.truncated |= bytes.len() > room;
+    }
+
+    fn snapshot(&self) -> (String, bool) {
+        (
+            String::from_utf8_lossy(&self.bytes).into_owned(),
+            self.truncated,
+        )
+    }
+}
+
+enum ProcRoute<'a> {
+    Poll(&'a str),
+    Kill(&'a str),
 }
 struct Request {
     method: String,
@@ -39,7 +93,7 @@ struct Request {
 
 enum ReadRequestError {
     Message(String),
-    ExecDenied,
+    ExecutionDenied,
 }
 
 fn main() {
@@ -59,6 +113,7 @@ fn run() -> Result<(), String> {
     let state = Arc::new(Server {
         secret,
         store: Store::open(config.state_file, config.max_events)?,
+        procs: Mutex::new(HashMap::new()),
     });
     if !config.github_watch_repos.is_empty() {
         let state = Arc::clone(&state);
@@ -352,13 +407,26 @@ fn serve(listener: TcpListener, state: Arc<Server>) {
     }
 }
 
-fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
+fn handle(stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
+    handle_with_policy(stream, state, || {
+        require_gui_login_session().and_then(|_| exec::load_policy())
+    })
+}
+
+fn handle_with_policy<F>(
+    mut stream: TcpStream,
+    state: Arc<Server>,
+    load_policy: F,
+) -> Result<(), String>
+where
+    F: Fn() -> Result<exec::Policy, String>,
+{
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|error| error.to_string())?;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
-        Err(ReadRequestError::ExecDenied) => {
+        Err(ReadRequestError::ExecutionDenied) => {
             denied(&mut stream, "")?;
             return Ok(());
         }
@@ -389,6 +457,17 @@ fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
         ("POST", "/v1/events") => post(&mut stream, &state, request.body),
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
         ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
+        ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
+        ("GET", path) => match proc_route(path) {
+            Some(ProcRoute::Poll(handle)) => poll_proc(&mut stream, &state, handle),
+            Some(ProcRoute::Kill(_)) => reply(&mut stream, 404, error("not_found")),
+            None => reply(&mut stream, 404, error("not_found")),
+        },
+        ("POST", path) => match proc_route(path) {
+            Some(ProcRoute::Kill(handle)) => kill_proc(&mut stream, &state, handle),
+            Some(ProcRoute::Poll(_)) => reply(&mut stream, 404, error("not_found")),
+            None => reply(&mut stream, 404, error("not_found")),
+        },
         _ => reply(&mut stream, 404, error("not_found")),
     }
 }
@@ -467,6 +546,289 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
     };
     let result = exec::run(path, request);
     reply(stream, 200, result.to_json())
+}
+
+fn spawn_request(
+    stream: &mut TcpStream,
+    state: &Server,
+    body: Vec<u8>,
+    policy: Result<exec::Policy, String>,
+) -> Result<(), String> {
+    let request = match parse_exec_request(&body) {
+        Ok(request) => request,
+        Err(denial) => return reply(stream, 200, denial),
+    };
+    eprintln!(
+        "spawn id={} bin={} subcommand={}",
+        request.id,
+        request.bin,
+        request.args.first().map(String::as_str).unwrap_or("")
+    );
+    let policy = match policy {
+        Ok(policy) => policy,
+        Err(message) => {
+            eprintln!("spawn policy read failed: {message}");
+            return reply(stream, 500, error("could_not_read_execution_policy"));
+        }
+    };
+    let path = match policy_path_or_denial(&policy, &request) {
+        Ok(path) => path,
+        Err(denial) => return reply(stream, 200, denial),
+    };
+    match spawn_proc(&state.procs, path, request) {
+        Ok(handle) => reply(
+            stream,
+            200,
+            Json::Object(vec![
+                ("id".to_owned(), Json::String(handle.id)),
+                ("proc".to_owned(), Json::String(handle.handle)),
+            ]),
+        ),
+        Err(_) => {
+            eprintln!("spawn failed");
+            reply(stream, 500, error("could_not_spawn_process"))
+        }
+    }
+}
+
+struct SpawnedProc {
+    id: String,
+    handle: String,
+}
+
+fn spawn_proc(
+    procs: &Mutex<HashMap<String, ProcEntry>>,
+    path: &str,
+    request: exec::ExecRequest,
+) -> Result<SpawnedProc, String> {
+    let stdout = Arc::new(Mutex::new(CappedOutput::default()));
+    let stderr = Arc::new(Mutex::new(CappedOutput::default()));
+    let mut child = Command::new(path)
+        .args(&request.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // A dedicated process group makes kill requests cover the command's
+        // descendants without involving the relay itself.
+        .process_group(0)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let child_stdout = child.stdout.take().expect("stdout was piped");
+    let child_stderr = child.stderr.take().expect("stderr was piped");
+    let process_group = child.id() as i32;
+    drain_to_capture(child_stdout, Arc::clone(&stdout));
+    drain_to_capture(child_stderr, Arc::clone(&stderr));
+    let mut table = procs
+        .lock()
+        .map_err(|_| "process table lock poisoned".to_owned())?;
+    prune_procs(&mut table, Instant::now());
+    let handle = unique_handle(&table)?;
+    let id = request.id;
+    table.insert(
+        handle.clone(),
+        ProcEntry {
+            child,
+            process_group,
+            id: id.clone(),
+            bin: request.bin,
+            subcommand: request.args.first().cloned().unwrap_or_default(),
+            spawned_at: Instant::now(),
+            finished_at: None,
+            leader_reaped: false,
+            exit_code: None,
+            stdout,
+            stderr,
+        },
+    );
+    prune_procs(&mut table, Instant::now());
+    Ok(SpawnedProc { id, handle })
+}
+
+fn drain_to_capture(mut pipe: impl Read + Send + 'static, capture: Arc<Mutex<CappedOutput>>) {
+    thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut output) = capture.lock() {
+                        output.append(&chunk[..n]);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Ok(mut output) = capture.lock() {
+            output.complete = true;
+        }
+    });
+}
+
+fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(), String> {
+    let result = {
+        let mut table = state
+            .procs
+            .lock()
+            .map_err(|_| "process table lock poisoned".to_owned())?;
+        prune_procs(&mut table, Instant::now());
+        let Some(entry) = table.get_mut(handle) else {
+            return reply(stream, 404, error("unknown_proc"));
+        };
+        update_proc_status(entry);
+        eprintln!(
+            "poll id={} bin={} subcommand={}",
+            entry.id, entry.bin, entry.subcommand
+        );
+        proc_json(entry)
+    };
+    reply(stream, 200, result)
+}
+
+fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(), String> {
+    let result = {
+        let mut table = state
+            .procs
+            .lock()
+            .map_err(|_| "process table lock poisoned".to_owned())?;
+        prune_procs(&mut table, Instant::now());
+        let Some(entry) = table.get_mut(handle) else {
+            return reply(stream, 404, error("unknown_proc"));
+        };
+        update_proc_status(entry);
+        let killed = if entry.finished_at.is_none() {
+            kill_process_group(entry.process_group)
+        } else {
+            false
+        };
+        if killed {
+            // Reap promptly when the signal is delivered before a subsequent
+            // poll, but do not block an HTTP request waiting for cleanup.
+            update_proc_status(entry);
+        }
+        eprintln!(
+            "kill id={} bin={} subcommand={}",
+            entry.id, entry.bin, entry.subcommand
+        );
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(entry.id.clone())),
+            ("killed".to_owned(), Json::Bool(killed)),
+        ])
+    };
+    reply(stream, 200, result)
+}
+
+fn update_proc_status(entry: &mut ProcEntry) {
+    if entry.finished_at.is_some() {
+        return;
+    }
+    if !entry.leader_reaped {
+        match entry.child.try_wait() {
+            Ok(Some(status)) => {
+                entry.exit_code = status.code();
+                entry.leader_reaped = true;
+            }
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("detached child wait failed: {error}");
+                return;
+            }
+        }
+    }
+    if !process_group_running(entry.process_group) && output_is_complete(entry) {
+        entry.finished_at = Some(Instant::now());
+    }
+}
+
+fn output_is_complete(entry: &ProcEntry) -> bool {
+    entry.stdout.lock().is_ok_and(|output| output.complete)
+        && entry.stderr.lock().is_ok_and(|output| output.complete)
+}
+
+fn proc_json(entry: &ProcEntry) -> Json {
+    let (stdout, stdout_truncated) = entry
+        .stdout
+        .lock()
+        .map(|output| output.snapshot())
+        .unwrap_or_default();
+    let (stderr, stderr_truncated) = entry
+        .stderr
+        .lock()
+        .map(|output| output.snapshot())
+        .unwrap_or_default();
+    Json::Object(vec![
+        ("id".to_owned(), Json::String(entry.id.clone())),
+        (
+            "running".to_owned(),
+            Json::Bool(entry.finished_at.is_none()),
+        ),
+        (
+            "exit_code".to_owned(),
+            entry
+                .exit_code
+                .map_or(Json::Null, |code| Json::Number(code.to_string())),
+        ),
+        ("stdout".to_owned(), Json::String(stdout)),
+        ("stderr".to_owned(), Json::String(stderr)),
+        (
+            "truncated".to_owned(),
+            Json::Bool(stdout_truncated || stderr_truncated),
+        ),
+    ])
+}
+
+fn kill_process_group(process_group: i32) -> bool {
+    // `process_group(0)` above creates a group whose id is the child PID.
+    unsafe { libc::kill(-process_group, libc::SIGTERM) == 0 }
+}
+
+fn process_group_running(process_group: i32) -> bool {
+    unsafe { libc::kill(-process_group, 0) == 0 }
+}
+
+fn unique_handle(entries: &HashMap<String, ProcEntry>) -> Result<String, String> {
+    loop {
+        let mut bytes = [0u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut bytes))
+            .map_err(|error| format!("could not generate process handle: {error}"))?;
+        let handle = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if !entries.contains_key(&handle) {
+            return Ok(handle);
+        }
+    }
+}
+
+fn prune_procs(entries: &mut HashMap<String, ProcEntry>, now: Instant) {
+    for entry in entries.values_mut() {
+        update_proc_status(entry);
+    }
+    entries.retain(|_, entry| {
+        entry
+            .finished_at
+            .is_none_or(|finished| now.duration_since(finished) <= FINISHED_PROC_RETENTION)
+    });
+    let mut finished: Vec<_> = entries
+        .iter()
+        .filter_map(|(handle, entry)| entry.finished_at.map(|finished| (handle.clone(), finished)))
+        .collect();
+    finished.sort_by_key(|(handle, finished)| (*finished, entries[handle].spawned_at));
+    let excess = finished.len().saturating_sub(MAX_FINISHED_PROCS);
+    for (handle, _) in finished.into_iter().take(excess) {
+        entries.remove(&handle);
+    }
+}
+
+fn proc_route(path: &str) -> Option<ProcRoute<'_>> {
+    let path = path.strip_prefix("/v1/proc/")?;
+    if let Some(handle) = path.strip_suffix("/kill") {
+        (!handle.is_empty() && !handle.contains('/')).then_some(ProcRoute::Kill(handle))
+    } else {
+        (!path.is_empty() && !path.contains('/')).then_some(ProcRoute::Poll(path))
+    }
 }
 
 fn parse_exec_request(body: &[u8]) -> Result<exec::ExecRequest, Json> {
@@ -608,8 +970,13 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
             .map_err(|_| ReadRequestError::Message("invalid content length".to_owned()))
     })?;
     if length > MAX_BODY {
-        if method == "POST" && target.split('?').next() == Some("/v1/exec") {
-            return Err(ReadRequestError::ExecDenied);
+        if method == "POST"
+            && matches!(
+                target.split('?').next(),
+                Some("/v1/exec") | Some("/v1/spawn")
+            )
+        {
+            return Err(ReadRequestError::ExecutionDenied);
         }
         return Err(ReadRequestError::Message(
             "request body too large".to_owned(),
@@ -617,8 +984,13 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).map_err(|_| {
-        if method == "POST" && target.split('?').next() == Some("/v1/exec") {
-            ReadRequestError::ExecDenied
+        if method == "POST"
+            && matches!(
+                target.split('?').next(),
+                Some("/v1/exec") | Some("/v1/spawn")
+            )
+        {
+            ReadRequestError::ExecutionDenied
         } else {
             ReadRequestError::Message("short request body".to_owned())
         }
@@ -834,7 +1206,7 @@ mod tests {
         client.join().unwrap();
         assert!(matches!(
             read_request(&mut server),
-            Err(ReadRequestError::ExecDenied)
+            Err(ReadRequestError::ExecutionDenied)
         ));
     }
 
@@ -854,7 +1226,7 @@ mod tests {
         client.join().unwrap();
         assert!(matches!(
             read_request(&mut server),
-            Err(ReadRequestError::ExecDenied)
+            Err(ReadRequestError::ExecutionDenied)
         ));
     }
 
@@ -915,5 +1287,228 @@ mod tests {
             parse_github_open_pull_requests(r#"[{"number":0,"url":"https://example.test"}]"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn process_handles_are_unique_128_bit_hex_values() {
+        let mut entries = HashMap::new();
+        entries.insert("0".repeat(32), completed_entry());
+        let mut handles = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let handle = unique_handle(&entries).unwrap();
+            assert_eq!(handle.len(), 32);
+            assert!(handle.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(!entries.contains_key(&handle));
+            assert!(handles.insert(handle));
+        }
+    }
+
+    #[test]
+    fn captured_output_stops_at_the_exec_output_cap() {
+        let mut output = CappedOutput::default();
+        output.append(&vec![b'x'; exec::OUTPUT_CAP]);
+        output.append(b"extra");
+        let (captured, truncated) = output.snapshot();
+        assert_eq!(captured.len(), exec::OUTPUT_CAP);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn prune_drops_finished_entries_past_the_retention_window() {
+        let procs = Mutex::new(HashMap::new());
+        let request = exec::ExecRequest {
+            id: "old".to_owned(),
+            bin: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "exit 0".to_owned()],
+        };
+        let handle = spawn_proc(&procs, "/bin/sh", request).unwrap().handle;
+        let mut entries = procs.lock().unwrap();
+        let entry = entries.get_mut(&handle).unwrap();
+        let _ = entry.child.wait();
+        entry.finished_at = Some(Instant::now() - FINISHED_PROC_RETENTION - Duration::from_secs(1));
+        prune_procs(&mut entries, Instant::now());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn prune_keeps_at_most_128_finished_processes() {
+        let mut entries = HashMap::new();
+        for index in 0..=MAX_FINISHED_PROCS {
+            entries.insert(format!("{index:032x}"), completed_entry());
+        }
+        prune_procs(&mut entries, Instant::now());
+        assert_eq!(entries.len(), MAX_FINISHED_PROCS);
+    }
+
+    #[test]
+    fn detached_process_endpoints_authenticate_and_manage_process_trees() {
+        let policy =
+            exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#)
+                .unwrap();
+        let (state, state_path) = test_server();
+        let denied = request_once(
+            Arc::clone(&state),
+            &policy,
+            "POST",
+            "/v1/spawn",
+            r#"{"id":"bad","bin":"sh","args":["-c","true"],"extra":true}"#,
+        );
+        assert!(denied.starts_with("HTTP/1.1 200 OK"));
+        assert!(denied.ends_with(r#"{"id":"bad","error":"denied"}"#));
+
+        let handle = spawn_for_test(&state, &policy, "echo", "printf hello");
+        let completed = poll_until_complete(&state, &policy, &handle);
+        assert_eq!(
+            completed.object("exit_code"),
+            Some(&Json::Number("0".to_owned()))
+        );
+        assert_eq!(
+            completed.object("stdout"),
+            Some(&Json::String("hello".to_owned()))
+        );
+
+        // The shell leader exits immediately, leaving the sleep descendant in
+        // the dedicated process group. It must still be visible and killable.
+        let handle = spawn_for_test(&state, &policy, "sleep", "sleep 60 & exit");
+        let running = response_json(request_once(
+            Arc::clone(&state),
+            &policy,
+            "GET",
+            &format!("/v1/proc/{handle}"),
+            "",
+        ));
+        assert_eq!(running.object("running"), Some(&Json::Bool(true)));
+        let killed = response_json(request_once(
+            Arc::clone(&state),
+            &policy,
+            "POST",
+            &format!("/v1/proc/{handle}/kill"),
+            "",
+        ));
+        assert_eq!(killed.object("id"), Some(&Json::String("sleep".to_owned())));
+        assert_eq!(killed.object("killed"), Some(&Json::Bool(true)));
+        let completed = poll_until_complete(&state, &policy, &handle);
+        assert_eq!(completed.object("running"), Some(&Json::Bool(false)));
+
+        for (method, target) in [
+            ("GET", "/v1/proc/0123456789abcdef0123456789abcdef"),
+            ("POST", "/v1/proc/0123456789abcdef0123456789abcdef/kill"),
+        ] {
+            let response = request_once(Arc::clone(&state), &policy, method, target, "");
+            assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(response.ends_with(r#"{"error":"unknown_proc"}"#));
+        }
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    fn test_server() -> (Arc<Server>, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "zigzag-proc-test-{}",
+            unique_handle(&HashMap::new()).unwrap()
+        ));
+        (
+            Arc::new(Server {
+                secret: "x".repeat(32),
+                store: Store::open(&path, 1).unwrap(),
+                procs: Mutex::new(HashMap::new()),
+            }),
+            path,
+        )
+    }
+
+    fn completed_entry() -> ProcEntry {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let process_group = child.id() as i32;
+        let _ = child.wait();
+        ProcEntry {
+            child,
+            process_group,
+            id: "finished".to_owned(),
+            bin: "sh".to_owned(),
+            subcommand: "-c".to_owned(),
+            spawned_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            leader_reaped: true,
+            exit_code: Some(0),
+            stdout: Arc::new(Mutex::new(CappedOutput {
+                complete: true,
+                ..CappedOutput::default()
+            })),
+            stderr: Arc::new(Mutex::new(CappedOutput {
+                complete: true,
+                ..CappedOutput::default()
+            })),
+        }
+    }
+
+    fn request_once(
+        state: Arc<Server>,
+        policy: &exec::Policy,
+        method: &str,
+        target: &str,
+        body: &str,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = format!(
+            "{method} {target} HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{body}",
+            "x".repeat(32),
+            body.len()
+        );
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        let (server, _) = listener.accept().unwrap();
+        handle_with_policy(server, state, || Ok(policy.clone())).unwrap();
+        client.join().unwrap()
+    }
+
+    fn response_json(response: String) -> Json {
+        parse_json(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    fn spawn_for_test(
+        state: &Arc<Server>,
+        policy: &exec::Policy,
+        id: &str,
+        command: &str,
+    ) -> String {
+        let response = response_json(request_once(
+            Arc::clone(state),
+            policy,
+            "POST",
+            "/v1/spawn",
+            &format!(r#"{{"id":"{id}","bin":"sh","args":["-c","{command}"]}}"#),
+        ));
+        response
+            .object("proc")
+            .and_then(Json::as_str)
+            .unwrap()
+            .to_owned()
+    }
+
+    fn poll_until_complete(state: &Arc<Server>, policy: &exec::Policy, handle: &str) -> Json {
+        for _ in 0..100 {
+            let response = response_json(request_once(
+                Arc::clone(state),
+                policy,
+                "GET",
+                &format!("/v1/proc/{handle}"),
+                "",
+            ));
+            if response.object("running") == Some(&Json::Bool(false)) {
+                return response;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("process did not finish in time");
     }
 }
